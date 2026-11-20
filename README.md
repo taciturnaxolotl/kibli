@@ -24,6 +24,9 @@ xcrun devicectl device install app --device <device udid> build/Build/Products/D
 - [x] move detection: for a guessed position and the current camera, predict which squares should show bare wood (pieces hide the squares behind them), check how bare each looks, and pick the current position or the legal move that fits best. no reference frame, so the phone can move between moves; a two-move search catches up after a missed move. `tools/perft` checks the move generator, `tools/snapshot` replays captures that saved a locked board
 - [x] blackbox recorder (menu > record session): logs camera pose, intrinsics, every detection, lock, relock and move read, plus half-size frames at 2 fps. `tools/pull_captures.sh` pulls recordings too; `.venv/bin/python tools/recording.py samples/recordings/<name>` prints a timeline and renders the believed board onto each frame (and an mp4 with ffmpeg)
 - [x] locked board follows the real one: after a second of missed refinements it searches the whole view again, and relocks once three fresh sightings agree; sightings older than 8s are dropped because arkit's map drifts
+- [x] lidar occupancy: depth points placed on the board in 3d give each square's height, folded into move scoring alongside the camera check. recordings and captures save depth too
+- [x] training data: `tools/dataset/build.py` turns ChessReD2K (CC BY-NC-SA, research only) and samryan18 (MIT) into 165k labelled 32x32 square crops in `samples/datasets/squares.npz`; `tools/dataset/train_occupancy.py` trains a baseline occupancy net
+- [ ] occupancy net in the app (core ml), fine-tuned on our own board
 - [ ] piece classification, so games can start mid-way and missed moves can be recovered
 - [ ] engine (stockfish for analysis, maia for human-like moves)
 

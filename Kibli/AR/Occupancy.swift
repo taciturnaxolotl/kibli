@@ -89,7 +89,38 @@ enum Occupancy {
     /// Scores a position against a snapshot.
     static func score(_ position: Position, _ snapshot: BoardSnapshot) -> Float? {
         let bare = expectedBare(position, camera: snapshot.camera)
-        return bareness(snapshot, reference: bare).map { agreement(bare, $0) }
+        guard let looks = bareness(snapshot, reference: bare) else { return nil }
+        var total = agreement(bare, looks)
+        if let heights = snapshot.heights, let occupied = occupancy(fromHeights: heights, position: position) {
+            total += depthAgreement(position, occupied)
+        }
+        return total
+    }
+
+    /// 0 to 1 per square for how much something stands on it, from LiDAR, or
+    /// nil per square where there's no reading. The board surface level is
+    /// taken from squares the position says are empty, which soaks up any
+    /// error in the estimated board height.
+    static func occupancy(fromHeights heights: [Float?], position: Position) -> [Float?]? {
+        let emptyHeights = Square.all.compactMap { square -> Float? in
+            position[square] == nil ? heights[square.rank * 8 + square.file] : nil
+        }.sorted()
+        guard emptyHeights.count >= 6 else { return nil }
+        let surface = emptyHeights[emptyHeights.count / 2]
+        return heights.map { height in
+            height.map { 1 / (1 + exp(-(($0 - surface) - 0.35) / 0.08)) }
+        }
+    }
+
+    /// Like `agreement`, but only a square's own piece counts, since LiDAR
+    /// points sit where they really are instead of hiding squares behind.
+    static func depthAgreement(_ position: Position, _ occupied: [Float?]) -> Float {
+        var total: Float = 0
+        for square in Square.all {
+            guard let value = occupied[square.rank * 8 + square.file] else { continue }
+            total += (position[square] != nil ? value - 0.5 : 0.5 - value) * 1.5
+        }
+        return total
     }
 
     /// Searches move sequences of up to `plies` from `start`, keeping the

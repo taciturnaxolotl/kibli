@@ -87,6 +87,9 @@ final class BoardTracker {
     private(set) var moveCount = 0
     /// Bumped whenever the locked board jumps to follow the real one.
     private(set) var relockCount = 0
+    private(set) var hasDepth = false
+    /// LiDAR occupancy per square at the last still moment, for the debug panel.
+    private(set) var lastDepthOccupancy: [Float?]?
     var watchesMoves = true
 
     @ObservationIgnored private weak var arView: ARView?
@@ -142,6 +145,10 @@ final class BoardTracker {
         guard let session = arView?.session else { return }
         let configuration = ARWorldTrackingConfiguration()
         configuration.planeDetection = [.horizontal]
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            configuration.frameSemantics.insert(.smoothedSceneDepth)
+        }
+        hasDepth = ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth)
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         focus.prepare()
         resetState()
@@ -276,7 +283,7 @@ final class BoardTracker {
         if note != trackingNote { trackingNote = note }
         updateVisibility(now: frame.timestamp)
         if let pose { focus.aim(at: pose.center, frame: frame) }
-        recorder.frame(frame) { LumaPlane(frame.capturedImage) }
+        recorder.frame(frame, luma: { LumaPlane(frame.capturedImage) }, depth: { DepthPlane(frame) })
 
         switch phase {
         case .findingTable:
@@ -287,8 +294,6 @@ final class BoardTracker {
         case .locked:
             runDetectionIfDue(frame, interval: lockedDetectionInterval)
             if watchesMoves { watchForMoves(frame) }
-        default:
-            break
         }
     }
 
@@ -314,12 +319,15 @@ final class BoardTracker {
 
         let request = MoveDetector.Frame(
             luma: luma, intrinsics: frame.camera.intrinsics, camera: frame.camera.transform,
-            board: board.transform, side: board.side
+            board: board.transform, side: board.side, depth: DepthPlane(frame)
         )
         let started = moveDetector.process(
             request, position: game.position, findOrientation: needsOrientation && game.records.isEmpty
-        ) { [weak self] event in
-            Task { @MainActor in self?.handle(event) }
+        ) { [weak self] event, depth in
+            Task { @MainActor in
+                if let depth { self?.lastDepthOccupancy = depth }
+                self?.handle(event)
+            }
         }
         if started { lastMoveCheck = frame.timestamp }
     }

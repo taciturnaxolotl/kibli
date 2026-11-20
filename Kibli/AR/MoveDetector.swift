@@ -26,6 +26,7 @@ final class MoveDetector: @unchecked Sendable {
         let camera: simd_float4x4
         let board: simd_float4x4
         let side: Float
+        var depth: DepthPlane?
     }
 
     /// Change in bare squares between frames, in normalized luma units, that
@@ -55,7 +56,7 @@ final class MoveDetector: @unchecked Sendable {
 
     /// Returns false without doing anything if the last frame is still being
     /// processed.
-    func process(_ frame: Frame, position: Position, findOrientation: Bool, completion: @escaping @Sendable (Event) -> Void) -> Bool {
+    func process(_ frame: Frame, position: Position, findOrientation: Bool, completion: @escaping @Sendable (Event, _ depthOccupancy: [Float?]?) -> Void) -> Bool {
         lock.lock()
         if busy {
             lock.unlock()
@@ -66,11 +67,17 @@ final class MoveDetector: @unchecked Sendable {
 
         queue.async { [self] in
             var event = Event.busy
-            if let snapshot = BoardSnapshot(
+            var depthOccupancy: [Float?]?
+            if var snapshot = BoardSnapshot(
                 luma: frame.luma, intrinsics: frame.intrinsics, cameraTransform: frame.camera,
                 board: frame.board, side: frame.side
             ) {
+                snapshot.heights = frame.depth?.squareHeights(
+                    imageIntrinsics: frame.intrinsics, imageWidth: frame.luma.width,
+                    cameraTransform: frame.camera, board: frame.board, side: frame.side
+                )
                 event = handle(snapshot, position: position)
+                depthOccupancy = snapshot.heights.flatMap { Occupancy.occupancy(fromHeights: $0, position: position) }
                 if findOrientation, case .settled = event, let turns = snapshot.startOrientation() {
                     event = .oriented(quarterTurns: turns)
                 }
@@ -78,7 +85,7 @@ final class MoveDetector: @unchecked Sendable {
             lock.lock()
             busy = false
             lock.unlock()
-            completion(event)
+            completion(event, depthOccupancy)
         }
         return true
     }

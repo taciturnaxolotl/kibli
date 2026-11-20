@@ -76,7 +76,7 @@ final class Recorder {
 
     /// Logs the camera pose about ten times a second and saves an image
     /// twice a second.
-    func frame(_ frame: ARFrame, luma: () -> LumaPlane?) {
+    func frame(_ frame: ARFrame, luma: () -> LumaPlane?, depth: () -> DepthPlane?) {
         guard isRecording, frame.timestamp - lastFrameLog >= 0.1 else { return }
         lastFrameLog = frame.timestamp
 
@@ -94,6 +94,12 @@ final class Recorder {
             fields["imageScale"] = 0.5
             let url = folder!.appending(path: name)
             queue.async { Self.writeHalfSize(plane, to: url) }
+            if let depth = depth() {
+                let depthName = String(format: "frames/%06d.depth", imageIndex)
+                fields["depth"] = depthName
+                let depthURL = folder!.appending(path: depthName)
+                queue.async { try? depth.encoded.write(to: depthURL) }
+            }
         }
         log("frame", fields, time: frame.timestamp)
     }

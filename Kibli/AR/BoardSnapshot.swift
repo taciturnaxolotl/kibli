@@ -13,6 +13,9 @@ struct BoardSnapshot: Sendable {
     /// Mean brightness, spread and edge energy of the middle of each square,
     /// indexed rank * 8 + file.
     private(set) var stats: [(mean: Float, deviation: Float, edges: Float)] = []
+    /// LiDAR height of each square's contents in squares, nil where the
+    /// sensor saw nothing or there is no LiDAR.
+    var heights: [Float?]?
     /// Fraction of each square that was inside the camera image.
     private(set) var visible: [Float] = []
     private let valid: [Bool]

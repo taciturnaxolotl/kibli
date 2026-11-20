@@ -530,9 +530,15 @@ private struct DebugPanel: View {
             .frame(width: 120, height: 120)
             .clipShape(.rect(cornerRadius: 12))
 
-            if let changes = tracker.lastChanges {
-                ChangeMap(changes: changes)
-                    .frame(width: 80, height: 80)
+            VStack(spacing: 6) {
+                if let changes = tracker.lastChanges {
+                    ChangeMap(changes: changes.map { 1 - $0 }, tint: .orange)
+                        .frame(width: 64, height: 64)
+                }
+                if let depth = tracker.lastDepthOccupancy {
+                    ChangeMap(changes: depth.map { $0 ?? 0 }, tint: .cyan)
+                        .frame(width: 64, height: 64)
+                }
             }
 
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 3) {
@@ -541,6 +547,7 @@ private struct DebugPanel: View {
                 row("surface", tracker.surfaceHeight.map { String(format: "+%.1f cm", $0 * 100) } ?? "n/a")
                 row("calibrated", "\(Int(tracker.calibration * 100))%")
                 row("turns", "\(tracker.quarterTurns)")
+                row("lidar", tracker.hasDepth ? "on" : "none")
                 row("fit", tracker.fit.map { String(format: "%.1f", $0) } ?? "n/a")
                 row("captures", "\(tracker.captureCount)")
             }
@@ -559,17 +566,18 @@ private struct DebugPanel: View {
     }
 }
 
-/// Which squares looked covered at the last still moment, brightest where
-/// a square looked least like bare board.
+/// A per-square 0 to 1 map, brightest where the value is highest: how
+/// covered squares looked in the camera (orange) or by LiDAR (cyan).
 private struct ChangeMap: View {
     let changes: [Float]
+    var tint: Color = .orange
 
     var body: some View {
         Grid(horizontalSpacing: 1, verticalSpacing: 1) {
             ForEach((0..<8).reversed(), id: \.self) { rank in
                 GridRow {
                     ForEach(0..<8, id: \.self) { file in
-                        Rectangle().fill(Color.orange.opacity(Double(1 - changes[rank * 8 + file])))
+                        Rectangle().fill(tint.opacity(Double(changes[rank * 8 + file])))
                             .background(Color.black.opacity(0.3))
                     }
                 }

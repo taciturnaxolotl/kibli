@@ -37,6 +37,7 @@ enum FrameCapture {
 
     static func save(frame: ARFrame, board: BoardPose?, quarterTurns: Int, tablePlaneY: Float?) async throws -> URL {
         let image = CIImage(cvPixelBuffer: frame.capturedImage)
+        let depth = DepthPlane(frame)
         let intrinsics = frame.camera.intrinsics
         let transform = frame.camera.transform
         let metadata = Metadata(
@@ -65,6 +66,7 @@ enum FrameCapture {
                   )
             else { throw CocoaError(.fileWriteUnknown) }
             try jpeg.write(to: folder.appending(path: "frame.jpg"))
+            if let depth { try depth.encoded.write(to: folder.appending(path: "depth.bin")) }
 
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
