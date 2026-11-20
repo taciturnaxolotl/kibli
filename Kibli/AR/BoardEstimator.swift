@@ -40,7 +40,9 @@ struct BoardObservation: Sendable {
 struct BoardEstimator {
     private(set) var observations: [BoardObservation] = []
 
-    var window: TimeInterval = 20
+    /// ARKit's map drifts by a centimeter or two over half a minute, so old
+    /// sightings go stale.
+    var window: TimeInterval = 8
     var maxObservations = 60
     /// Assumed surface height above the table before there is parallax to
     /// measure, and how strongly to lean on that guess.

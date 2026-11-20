@@ -19,12 +19,18 @@ final class BoardLocator: @unchecked Sendable {
 
     struct Detection: @unchecked Sendable {
         let pose: BoardPose?
+        /// True when this came from refining a known board rather than a
+        /// fresh search.
+        var tracked = false
         /// The grid corners projected onto the plane the search assumed, before
         /// any correction for how far the board's surface sits above it.
         let observation: BoardObservation?
         let checker: Int
         let edge: Float
         let debugImage: CGImage?
+        /// How many of the best grid's corners were inside the camera image,
+        /// 0 to 4, whether or not it was good enough to accept.
+        var cornersInView = 0
     }
 
     var minimumChecker = 55
@@ -92,11 +98,22 @@ final class BoardLocator: @unchecked Sendable {
         }
         return Detection(
             pose: pose,
+            tracked: tracking,
             observation: observation,
             checker: grid.checker,
             edge: grid.edge,
-            debugImage: request.wantsDebugImage ? Self.debugImage(image, corners: grid.corners) : nil
+            debugImage: request.wantsDebugImage ? Self.debugImage(image, corners: grid.corners) : nil,
+            cornersInView: grid.corners.map(image.world).filter { Self.inView($0, request) }.count
         )
+    }
+
+    private static func inView(_ world: SIMD3<Float>, _ request: Request) -> Bool {
+        let p = request.camera.inverse * SIMD4(world, 1)
+        guard -p.z > 0.05 else { return false }
+        let k = request.intrinsics
+        let u = k.columns.2.x + k.columns.0.x * p.x / -p.z
+        let v = k.columns.2.y - k.columns.1.y * p.y / -p.z
+        return u >= 0 && v >= 0 && u < Float(request.luma.width) && v < Float(request.luma.height)
     }
 
     /// a1 is always a dark square. Votes over every neighbouring pair of

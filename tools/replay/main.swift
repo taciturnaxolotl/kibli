@@ -39,6 +39,7 @@ let out = URL(fileURLWithPath: args.count > 2 ? args[2] : "/tmp/kibli_replay")
 try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
 
 var sessions: [[(name: String, observation: BoardObservation, edge: Float)]] = []
+var frames: [String: (luma: LumaPlane, intrinsics: simd_float3x3, camera: simd_float4x4)] = [:]
 var lastTime: Date?
 let iso = ISO8601DateFormatter()
 
@@ -86,6 +87,7 @@ for name in try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted
         var observation = BoardObservation(corners: grid.corners.map(image.world), planeY: planeY, camera: origin)
         observation.time = time.timeIntervalSinceReferenceDate
         sessions[sessions.count - 1].append((name, observation, grid.edge))
+        frames[name] = (LumaPlane(buffer)!, intrinsics, camera)
     }
     if let grid {
         let sides = (0..<4).map { simd_distance(grid.corners[$0], grid.corners[($0 + 1) % 4]) * 2 }
@@ -134,3 +136,30 @@ for session in sessions where session.count >= 3 {
     }
 }
 print("slid \(slid)/\(total)")
+
+// Board snapshots from the fused pose, and how much they differ frame to
+// frame. Nothing moved within these sessions except where noted, so this is
+// the noise the move detector has to see past.
+print("\nsnapshots")
+for session in sessions where session.count >= 3 {
+    var estimator = BoardEstimator()
+    estimator.window = .infinity
+    for frame in session { estimator.add(frame.observation) }
+    guard let fused = estimator.pose(referenceYaw: 0) else { continue }
+    var last: BoardSnapshot?
+    for frame in session {
+        guard let f = frames[frame.name],
+              let snap = BoardSnapshot(luma: f.luma, intrinsics: f.intrinsics, cameraTransform: f.camera,
+                                       board: fused.transform, side: fused.side) else { continue }
+        var pgm = Data("P5\n\(BoardSnapshot.size) \(BoardSnapshot.size)\n255\n".utf8)
+        pgm.append(contentsOf: snap.pixels.map { UInt8(min(max($0, 0), 255)) })
+        try pgm.write(to: out.appendingPathComponent("snap_\(frame.name).pgm"))
+        if let last {
+            let d = snap.difference(from: last)
+            let sorted = d.sorted()
+            print(String(format: "  %@ median=%5.1f p90=%5.1f max=%5.1f", frame.name, sorted[32], sorted[57], sorted[63]))
+        }
+        last = snap
+        print("  \(frame.name) start orientation: \(snap.startOrientation().map(String.init) ?? "not a start position")")
+    }
+}

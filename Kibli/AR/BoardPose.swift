@@ -82,19 +82,6 @@ struct BoardPose: Equatable, Sendable {
         )
     }
 
-    /// Two taps on opposite corners: the outer corner of a1 and of h8.
-    static func fromDiagonal(a1: SIMD3<Float>, h8: SIMD3<Float>) -> BoardPose? {
-        var diagonal = h8 - a1
-        diagonal.y = 0
-        let length = simd_length(diagonal)
-        guard length > 0.05 else { return nil }
-        return BoardPose(
-            center: (a1 + h8) / 2,
-            yaw: atan2(-diagonal.z, diagonal.x) - .pi / 4,
-            side: length / Float(2).squareRoot()
-        )
-    }
-
     /// Blends toward `other`, treating yaw as defined modulo a quarter turn
     /// since a square looks the same rotated by 90 degrees.
     func blended(toward other: BoardPose, amount: Float) -> BoardPose {

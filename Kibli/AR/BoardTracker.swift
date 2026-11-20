@@ -12,7 +12,6 @@ final class BoardTracker {
     enum Phase: Equatable {
         case findingTable
         case findingBoard(progress: Double)
-        case tappingCorners(remaining: Int)
         case locked
     }
 
@@ -35,12 +34,23 @@ final class BoardTracker {
     }
 
     private(set) var visibility: Visibility = .notSeen(seconds: 0)
+
+    /// What's standing between the app and a lock, most pressing first.
+    enum SearchHint: Equatable {
+        case mapTable
+        case aimAtTable
+        case tooFar
+        case tooFlat
+        case partlyOutOfView
+        case unclearSquares
+        case holdSteady
+    }
+
+    private(set) var searchHint: SearchHint = .mapTable
     /// Sightings currently feeding the fused pose.
     private(set) var sightings = 0
     /// Bumped on every lock, so the view can play a haptic.
     private(set) var lockCount = 0
-    /// Locked from corner taps, so there are no grid sightings to follow.
-    private(set) var isManualLock = false
     /// Bumped on every saved capture.
     private(set) var savedCount = 0
 
@@ -53,23 +63,63 @@ final class BoardTracker {
     var quarterTurns = 0 { didSet { refreshOverlay() } }
     var showsDebug = false
 
+    // MARK: Game state
+
+    enum Watch: Equatable {
+        /// Board not locked yet.
+        case idle
+        /// Waiting for a still view of the starting position.
+        case findingStart
+        case watching
+        case handInView
+        case unclear
+    }
+
+    private(set) var game = Game()
+    private(set) var watch: Watch = .idle
+    /// How bare each square looked at the last still moment, for the debug
+    /// panel.
+    private(set) var lastChanges: [Float]?
+    /// How well the tracked position explains the board, around 30 when
+    /// everything matches.
+    private(set) var fit: Float?
+    /// Bumped whenever a move is recognized.
+    private(set) var moveCount = 0
+    /// Bumped whenever the locked board jumps to follow the real one.
+    private(set) var relockCount = 0
+    var watchesMoves = true
+
     @ObservationIgnored private weak var arView: ARView?
     @ObservationIgnored private let overlay = BoardOverlay()
     @ObservationIgnored private let overlayAnchor = AnchorEntity(world: .zero)
     @ObservationIgnored private let locator = BoardLocator()
     @ObservationIgnored private let delegate = SessionDelegate()
     @ObservationIgnored private let focus = CameraFocus()
+    @ObservationIgnored private let moveDetector = MoveDetector()
+    @ObservationIgnored let recorder = Recorder()
+    private(set) var isRecording = false
+    private(set) var recordingStarted: Date?
+    @ObservationIgnored private var lastMoveCheck: TimeInterval = 0
+    @ObservationIgnored private var needsOrientation = true
+    /// Locked-mode refinements in a row that couldn't find the board where
+    /// it was expected. After a few, search the whole view again.
+    @ObservationIgnored private var trackingMisses = 0
+    /// Camera distance and viewing angle (degrees above the table) for the
+    /// last search, used to explain why it failed.
+    @ObservationIgnored private var lastSearchGeometry: (distance: Float, elevation: Float)?
+    /// Recent search outcomes, so a single bad frame doesn't flip the hint.
+    @ObservationIgnored private var recentHints: [SearchHint] = []
+    /// Fresh sightings that disagree with the locked pose. If several agree
+    /// with each other, the board (or ARKit's map) has moved and we follow.
+    @ObservationIgnored private var relockCandidates: [(time: TimeInterval, pose: BoardPose, observation: BoardObservation)] = []
 
     @ObservationIgnored private var pose: BoardPose?
-    @ObservationIgnored private var recentPoses: [(time: TimeInterval, pose: BoardPose)] = []
+    @ObservationIgnored private var recentPoses: [(time: TimeInterval, pose: BoardPose, observation: BoardObservation)] = []
     @ObservationIgnored private var estimator = BoardEstimator()
     @ObservationIgnored private var referenceYaw: Float?
     @ObservationIgnored private var lastDetection: TimeInterval = 0
     @ObservationIgnored private var lastAccepted: TimeInterval?
     @ObservationIgnored private var lastGlimpse: TimeInterval?
-    @ObservationIgnored private var cornerTaps: [SIMD3<Float>] = []
-    /// Corner-tap locks have no grid sightings, so keep them still.
-    @ObservationIgnored private var refinesWhileLocked = true
 
     private let detectionInterval: TimeInterval = 0.1
     private let lockedDetectionInterval: TimeInterval = 0.25
@@ -98,12 +148,8 @@ final class BoardTracker {
     }
 
     func reset() {
+        recorder.log("user", ["action": "reset"])
         resetState()
-    }
-
-    func beginCornerTaps() {
-        reset()
-        phase = .tappingCorners(remaining: 2)
     }
 
     func capture() {
@@ -115,13 +161,54 @@ final class BoardTracker {
                 _ = try await FrameCapture.save(frame: frame, board: board, quarterTurns: quarterTurns, tablePlaneY: table)
                 captureCount = FrameCapture.count
                 savedCount += 1
-                captureNote = board == nil ? "Saved (no board locked)" : "Saved frame \(captureCount)"
+                let total = captureCount == 1 ? "1 capture" : "\(captureCount) captures"
+                captureNote = board == nil ? "Saved without a board, \(total)" : "Saved, \(total)"
             } catch {
                 captureNote = "Save failed: \(error.localizedDescription)"
             }
             try? await Task.sleep(for: .seconds(2))
             captureNote = nil
         }
+    }
+
+    func toggleRecording() {
+        if recorder.isRecording {
+            recorder.stop()
+        } else {
+            recorder.start()
+            recorder.log("state", [
+                "phase": "\(phase)", "quarterTurns": quarterTurns,
+                "pose": pose.map { ["center": $0.center.array, "yaw": $0.yaw, "side": $0.side] } ?? NSNull(),
+                "moves": game.records.map(\.san),
+            ])
+        }
+        isRecording = recorder.isRecording
+        recordingStarted = recorder.startedAt
+    }
+
+    func newGame() {
+        recorder.log("user", ["action": "newGame"])
+        game = Game()
+        needsOrientation = true
+        lastChanges = nil
+        moveDetector.reset()
+        overlay.showLastMove([])
+        watch = phase == .locked ? .findingStart : .idle
+    }
+
+    func undoMove() {
+        recorder.log("user", ["action": "undo"])
+        game.undo()
+        moveDetector.reset()
+        overlay.showLastMove(game.lastMove?.touched.prefix(2).map { $0 } ?? [])
+    }
+
+    /// Swaps which end is white's.
+    func flip() {
+        recorder.log("user", ["action": "flip"])
+        quarterTurns = (quarterTurns + 2) % 4
+        needsOrientation = false
+        moveDetector.reset()
     }
 
     func clearDrawings() {
@@ -136,13 +223,14 @@ final class BoardTracker {
         referenceYaw = nil
         surfaceHeight = nil
         parallax = 0
-        refinesWhileLocked = true
-        isManualLock = false
         lastAccepted = nil
         lastGlimpse = nil
+        moveDetector.reset()
+        watch = .idle
+        trackingMisses = 0
+        relockCandidates.removeAll()
         sightings = 0
         visibility = .notSeen(seconds: 0)
-        cornerTaps.removeAll()
         selected = nil
         lastTapped = nil
         overlay.clearDrawings()
@@ -156,18 +244,6 @@ final class BoardTracker {
     func handleTap(at point: CGPoint) {
         guard let arView else { return }
         switch phase {
-        case .tappingCorners(let remaining):
-            guard let hit = arView.raycast(from: point, allowing: .estimatedPlane, alignment: .horizontal).first else { return }
-            cornerTaps.append(hit.worldTransform.translation)
-            if remaining > 1 {
-                phase = .tappingCorners(remaining: remaining - 1)
-            } else if let pose = BoardPose.fromDiagonal(a1: cornerTaps[0], h8: cornerTaps[1]) {
-                lock(pose)
-                refinesWhileLocked = false
-                isManualLock = true
-            } else {
-                beginCornerTaps()
-            }
         case .locked:
             guard let pose, let ray = arView.ray(through: point),
                   let world = Self.intersect(origin: ray.origin, direction: ray.direction, planeY: pose.center.y),
@@ -200,14 +276,17 @@ final class BoardTracker {
         if note != trackingNote { trackingNote = note }
         updateVisibility(now: frame.timestamp)
         if let pose { focus.aim(at: pose.center, frame: frame) }
+        recorder.frame(frame) { LumaPlane(frame.capturedImage) }
 
         switch phase {
         case .findingTable:
+            searchHint = .mapTable
             if hasTablePlane { phase = .findingBoard(progress: 0) }
         case .findingBoard:
             runDetectionIfDue(frame, interval: detectionInterval)
-        case .locked where refinesWhileLocked:
+        case .locked:
             runDetectionIfDue(frame, interval: lockedDetectionInterval)
+            if watchesMoves { watchForMoves(frame) }
         default:
             break
         }
@@ -220,11 +299,91 @@ final class BoardTracker {
 
     // MARK: Detection
 
+    /// The board as the user sees it: the tracked pose turned so white is at
+    /// the bottom.
+    private var effectivePose: BoardPose? {
+        pose.map { BoardPose(center: $0.center, yaw: $0.yaw + Float(quarterTurns) * .pi / 2, side: $0.side) }
+    }
+
+    private func watchForMoves(_ frame: ARFrame) {
+        guard frame.timestamp - lastMoveCheck >= 0.2,
+              case .normal = frame.camera.trackingState,
+              let board = effectivePose,
+              let luma = LumaPlane(frame.capturedImage)
+        else { return }
+
+        let request = MoveDetector.Frame(
+            luma: luma, intrinsics: frame.camera.intrinsics, camera: frame.camera.transform,
+            board: board.transform, side: board.side
+        )
+        let started = moveDetector.process(
+            request, position: game.position, findOrientation: needsOrientation && game.records.isEmpty
+        ) { [weak self] event in
+            Task { @MainActor in self?.handle(event) }
+        }
+        if started { lastMoveCheck = frame.timestamp }
+    }
+
+    private func handle(_ event: MoveDetector.Event) {
+        guard phase == .locked else { return }
+        if recorder.isRecording {
+            switch event {
+            case .busy: recorder.log("moves", ["event": "busy"])
+            case .settled(let fit): recorder.log("moves", ["event": "settled", "fit": fit])
+            case .oriented(let turns): recorder.log("moves", ["event": "oriented", "turns": turns])
+            case .unclear(let bareness): recorder.log("moves", ["event": "unclear", "bareness": bareness])
+            case .moved(let moves, let bareness):
+                var position = game.position
+                let san = moves.map { move -> String in
+                    defer { position = position.playing(move) }
+                    return position.san(move)
+                }
+                recorder.log("moves", ["event": "moved", "san": san, "bareness": bareness])
+            }
+        }
+        let waiting = needsOrientation && game.records.isEmpty
+        switch event {
+        case .busy:
+            setWatch(.handInView)
+        case .settled(let fit):
+            self.fit = fit
+            setWatch(waiting ? .findingStart : .watching)
+        case .oriented(let turns):
+            needsOrientation = false
+            if turns != 0 {
+                quarterTurns = (quarterTurns + turns) % 4
+                moveDetector.reset()
+            }
+            setWatch(.watching)
+        case .unclear(let bareness):
+            lastChanges = bareness
+            setWatch(.unclear)
+        case .moved(let moves, let bareness):
+            lastChanges = bareness
+            needsOrientation = false
+            for move in moves { game.play(move) }
+            moveCount += 1
+            if let last = moves.last { overlay.showLastMove([last.from, last.to]) }
+            setWatch(.watching)
+        }
+    }
+
+    private func setWatch(_ value: Watch) {
+        if watch != value { watch = value }
+    }
+
     private func runDetectionIfDue(_ frame: ARFrame, interval: TimeInterval) {
         guard frame.timestamp - lastDetection >= interval,
-              case .normal = frame.camera.trackingState,
-              let target = searchTarget(frame)
+              case .normal = frame.camera.trackingState
         else { return }
+        guard let target = searchTarget(frame) else {
+            if phase != .locked { setHint(hasTablePlane ? .aimAtTable : .mapTable, immediate: true) }
+            return
+        }
+        let eye = frame.camera.transform.translation
+        let spot = SIMD3(target.center.x, target.planeY, target.center.y)
+        let distance = simd_distance(eye, spot)
+        lastSearchGeometry = (distance, asin(min(max((eye.y - target.planeY) / max(distance, 0.01), -1), 1)) * 180 / .pi)
 
         guard let luma = LumaPlane(frame.capturedImage) else { return }
         let request = BoardLocator.Request(
@@ -233,7 +392,8 @@ final class BoardTracker {
             camera: frame.camera.transform,
             planeY: target.planeY,
             center: target.center,
-            predicted: phase == .locked ? predictedCorners(planeY: target.planeY, camera: frame.camera.transform.translation) : nil,
+            predicted: phase == .locked && trackingMisses < 4
+                ? predictedCorners(planeY: target.planeY, camera: frame.camera.transform.translation) : nil,
             wantsDebugImage: showsDebug
         )
         let timestamp = frame.timestamp
@@ -284,6 +444,33 @@ final class BoardTracker {
     }
 
     private func consume(_ detection: BoardLocator.Detection?, timestamp: TimeInterval) {
+        if recorder.isRecording {
+            var fields: [String: Any] = [
+                "phase": "\(phase)",
+                "found": detection?.observation != nil,
+                "tracked": detection?.tracked ?? false,
+                "checker": detection?.checker ?? 0,
+                "edge": detection?.edge ?? 0,
+                "trackingMisses": trackingMisses,
+            ]
+            if let observation = detection?.observation {
+                fields["corners"] = observation.corners.map(\.array)
+                fields["planeY"] = observation.planeY
+            }
+            if let candidate = detection?.pose {
+                fields["candidate"] = ["center": candidate.center.array, "yaw": candidate.yaw, "side": candidate.side]
+            }
+            recorder.log("detection", fields, time: timestamp)
+        }
+        defer {
+            if recorder.isRecording, let pose {
+                recorder.log("pose", [
+                    "center": pose.center.array, "yaw": pose.yaw, "side": pose.side,
+                    "surface": surfaceHeight ?? NSNull(), "parallax": parallax, "sightings": sightings,
+                    "quarterTurns": quarterTurns,
+                ], time: timestamp)
+            }
+        }
         if let image = detection?.debugImage { debugImage = image }
         lastChecker = detection?.checker ?? 0
         if (detection?.checker ?? 0) >= 40 { lastGlimpse = timestamp }
@@ -296,6 +483,7 @@ final class BoardTracker {
     }
 
     private func consumeWhileSearching(_ detection: BoardLocator.Detection?, timestamp: TimeInterval) {
+        setHint(hint(for: detection), immediate: false)
         guard let candidate = detection?.pose, var observation = detection?.observation,
               (0.15...0.8).contains(candidate.side)
         else {
@@ -316,32 +504,71 @@ final class BoardTracker {
         sightings = estimator.observations.count
 
         pose = fusedPose() ?? candidate
-        recentPoses.append((timestamp, candidate))
+        recentPoses.append((timestamp, candidate, observation))
         recentPoses.removeAll { timestamp - $0.time > stabilityWindow }
 
         overlay.root.isEnabled = true
         refreshOverlay()
         updateProgress()
 
-        if isStable, let pose {
-            lock(pose)
+        if let agreeing = stableRun() {
+            // Lock from only the sightings that agreed, so an earlier frame
+            // where the grid slid a square doesn't drag the result.
+            estimator.reset()
+            for sample in agreeing { estimator.add(sample.observation) }
+            if let fused = fusedPose() {
+                pose = fused
+                lock(fused)
+            }
         }
     }
 
     /// Keeps folding in sightings after locking, so the height estimate
     /// improves as you walk around and tracking drift gets corrected.
     private func consumeWhileLocked(_ detection: BoardLocator.Detection?, timestamp: TimeInterval) {
-        guard let current = pose, var observation = detection?.observation else { return }
-        let rough = avg(observation.corners(atHeight: current.center.y))
-        guard simd_distance(rough, current.center) < 0.06 else { return }
-
+        guard let current = pose else { return }
+        guard let detection, var observation = detection.observation, let candidate = detection.pose else {
+            if detection?.tracked != false { trackingMisses += 1 }
+            return
+        }
         observation.time = timestamp
-        estimator.add(observation)
+        let rough = avg(observation.corners(atHeight: current.center.y))
+
+        if simd_distance(rough, current.center) < 0.03 {
+            trackingMisses = 0
+            relockCandidates.removeAll()
+            estimator.add(observation)
+            lastAccepted = timestamp
+            sightings = estimator.observations.count
+            guard let fused = fusedPose() else { return }
+            pose = current.blended(toward: fused, amount: 0.3)
+            refreshOverlay()
+            return
+        }
+
+        // A fresh search found the board somewhere else. Follow it once a few
+        // sightings in a row agree, keeping the game and orientation.
+        if detection.tracked { trackingMisses += 1; return }
+        relockCandidates.removeAll { timestamp - $0.time > 3 }
+        if let last = relockCandidates.last, simd_distance(last.pose.center, candidate.center) > 0.02 {
+            relockCandidates.removeAll()
+        }
+        relockCandidates.append((timestamp, candidate, observation))
+        guard relockCandidates.count >= 3 else { return }
+
+        estimator.reset()
+        for sighting in relockCandidates { estimator.add(sighting.observation) }
+        referenceYaw = current.yaw
+        relockCandidates.removeAll()
+        trackingMisses = 0
         lastAccepted = timestamp
-        sightings = estimator.observations.count
-        guard let fused = fusedPose() else { return }
-        pose = current.blended(toward: fused, amount: 0.3)
-        refreshOverlay()
+        if let fused = fusedPose() {
+            pose = fused
+            refreshOverlay()
+            moveDetector.reset()
+            relockCount += 1
+            recorder.log("relock", ["center": fused.center.array, "yaw": fused.yaw])
+        }
     }
 
     private func fusedPose() -> BoardPose? {
@@ -351,6 +578,33 @@ final class BoardTracker {
         }
         parallax = estimator.parallax
         return fused
+    }
+
+    /// Explains a search result in terms of something the user can change.
+    private func hint(for detection: BoardLocator.Detection?) -> SearchHint {
+        if detection?.pose != nil { return .holdSteady }
+        let checker = detection?.checker ?? 0
+        let corners = detection?.cornersInView ?? 0
+        if checker >= 30, corners < 4 { return .partlyOutOfView }
+        if let geometry = lastSearchGeometry {
+            if geometry.elevation < 25 { return .tooFlat }
+            if geometry.distance > 1.4 { return .tooFar }
+        }
+        if checker >= 30 { return .unclearSquares }
+        return corners < 4 && checker > 0 ? .partlyOutOfView : .unclearSquares
+    }
+
+    private func setHint(_ hint: SearchHint, immediate: Bool) {
+        if immediate {
+            recentHints = [hint]
+        } else {
+            recentHints.append(hint)
+            if recentHints.count > 5 { recentHints.removeFirst() }
+        }
+        // The most common hint over the last half second or so.
+        let counts = Dictionary(grouping: recentHints, by: { $0 }).mapValues(\.count)
+        let winner = counts.max { $0.value < $1.value }?.key ?? hint
+        if winner != searchHint { searchHint = winner }
     }
 
     private func updateVisibility(now: TimeInterval) {
@@ -366,21 +620,31 @@ final class BoardTracker {
         if next != visibility { visibility = next }
     }
 
-    private var isStable: Bool {
-        guard recentPoses.count >= samplesToLock, let pose else { return false }
-        return recentPoses.allSatisfy {
-            simd_distance($0.pose.center, pose.center) < stabilityTolerance
-                && abs($0.pose.side - pose.side) < stabilityTolerance
+    /// The latest sightings, if enough of them in a row agree with each
+    /// other. Compared on the table plane, before any height correction,
+    /// since that is what each sighting measured directly.
+    private func stableRun() -> [(time: TimeInterval, pose: BoardPose, observation: BoardObservation)]? {
+        let run = consistentRun()
+        return run.count >= samplesToLock ? run : nil
+    }
+
+    private func consistentRun() -> [(time: TimeInterval, pose: BoardPose, observation: BoardObservation)] {
+        guard let newest = recentPoses.last else { return [] }
+        var run = [newest]
+        for sample in recentPoses.dropLast().reversed() {
+            var offset = sample.pose.center - newest.pose.center
+            offset.y = 0
+            guard simd_length(offset) < stabilityTolerance,
+                  abs(sample.pose.side - newest.pose.side) < stabilityTolerance
+            else { break }
+            run.append(sample)
         }
+        return run
     }
 
     private func updateProgress() {
         guard case .findingBoard = phase else { return }
-        let consistent = recentPoses.filter { sample in
-            guard let pose else { return false }
-            return simd_distance(sample.pose.center, pose.center) < stabilityTolerance
-        }.count
-        phase = .findingBoard(progress: min(Double(consistent) / Double(samplesToLock), 1))
+        phase = .findingBoard(progress: min(Double(consistentRun().count) / Double(samplesToLock), 1))
     }
 
     private func lock(_ pose: BoardPose) {
@@ -391,6 +655,9 @@ final class BoardTracker {
         refreshOverlay()
         phase = .locked
         lockCount += 1
+        recorder.log("lock", ["center": pose.center.array, "yaw": pose.yaw, "side": pose.side])
+        moveDetector.reset()
+        watch = needsOrientation && game.records.isEmpty ? .findingStart : .watching
     }
 
     private func refreshOverlay() {

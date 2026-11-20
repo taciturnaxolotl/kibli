@@ -2,7 +2,7 @@ name: Kibli
 options:
   bundleIdPrefix: sh.dunkirk
   deploymentTarget:
-    iOS: "18.0"
+    iOS: "26.0"
   createIntermediateGroups: true
 settings:
   base:

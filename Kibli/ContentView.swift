@@ -5,6 +5,7 @@ import SwiftUI
 struct ContentView: View {
     @State private var tracker = BoardTracker()
     @State private var flash = false
+    @State private var showsGame = true
 
     var body: some View {
         ZStack {
@@ -12,35 +13,55 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
             Color.white
-                .opacity(flash ? 0.35 : 0)
+                .opacity(flash ? 0.3 : 0)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
-            VStack(spacing: 12) {
-                StatusCard(tracker: tracker)
+            if tracker.phase != .locked {
+                Reticle(found: tracker.searchHint == .holdSteady)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+
+            VStack(spacing: 10) {
+                StatusBar(tracker: tracker)
+                if tracker.phase != .locked {
+                    SearchChecklist(tracker: tracker)
+                        .transition(.blurReplace)
+                }
                 if tracker.showsDebug {
                     DebugPanel(tracker: tracker)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .transition(.blurReplace)
                 }
                 Spacer()
-                if let note = tracker.captureNote {
-                    Toast(text: note)
+                if tracker.phase == .locked, tracker.watchesMoves {
+                    GamePanel(tracker: tracker, expanded: $showsGame)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
-                ActionBar(tracker: tracker)
+                if let note = tracker.captureNote {
+                    Label(note, systemImage: note.hasPrefix("Save failed") ? "xmark.circle.fill" : "checkmark.circle.fill")
+                        .font(.subheadline.weight(.medium))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .glassEffect(.regular, in: .capsule)
+                        .transition(.blurReplace)
+                }
+                Toolbar(tracker: tracker)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .animation(.snappy, value: tracker.phase)
-            .animation(.snappy, value: tracker.showsDebug)
-            .animation(.snappy, value: tracker.captureNote)
+            .padding(.horizontal, 12)
+            .animation(.smooth, value: tracker.phase)
+            .animation(.smooth, value: tracker.showsDebug)
+            .animation(.smooth, value: showsGame)
+            .animation(.smooth, value: tracker.captureNote)
         }
         .sensoryFeedback(.success, trigger: tracker.lockCount)
+        .sensoryFeedback(.impact(weight: .medium), trigger: tracker.moveCount)
         .sensoryFeedback(.impact(weight: .light), trigger: tracker.savedCount)
         .onChange(of: tracker.savedCount) {
             flash = true
             withAnimation(.easeOut(duration: 0.4)) { flash = false }
         }
+        .statusBarHidden()
     }
 }
 
@@ -77,191 +98,417 @@ private struct BoardARView: UIViewRepresentable {
 
 // MARK: Status
 
-private struct StatusCard: View {
+private struct StatusBar: View {
     let tracker: BoardTracker
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                StepIndicator(phase: tracker.phase)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.headline)
-                        .contentTransition(.opacity)
-                    Text(detail)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
-            }
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(tint)
+                .symbolEffect(.pulse, isActive: tracker.phase != .locked)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 28)
 
-            if case .findingBoard(let progress) = tracker.phase {
-                ProgressView(value: progress)
-                    .tint(.orange)
-                    .animation(.snappy, value: progress)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.headline)
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
             }
+            .contentTransition(.opacity)
 
-            HStack(spacing: 6) {
-                CameraChip(note: tracker.trackingNote)
-                if showsBoardChips {
-                    BoardChip(tracker: tracker)
-                    HeightChip(tracker: tracker)
-                }
+            Spacer(minLength: 0)
+
+            if tracker.isRecording, let started = tracker.recordingStarted {
+                RecordingBadge(started: started)
             }
+            Accessory(tracker: tracker)
         }
-        .padding(14)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 22))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .glassEffect(.regular, in: .rect(cornerRadius: 26))
+        .animation(.smooth, value: title)
     }
 
-    private var showsBoardChips: Bool {
+    private var symbol: String {
+        if tracker.trackingNote != nil { return "exclamationmark.triangle.fill" }
         switch tracker.phase {
-        case .findingBoard, .locked: true
-        default: false
+        case .findingTable, .findingBoard: return tracker.searchHint.symbol
+        case .locked:
+            switch tracker.visibility {
+            case .seeing: return "checkmark.circle.fill"
+            case .glimpsing: return "eye.trianglebadge.exclamationmark"
+            case .notSeen: return "eye.slash"
+            }
+        }
+    }
+
+    private var tint: Color {
+        if tracker.trackingNote != nil { return .yellow }
+        switch tracker.phase {
+        case .findingTable: return .secondary
+        case .findingBoard: return .orange
+        case .locked: return tracker.visibility == .seeing ? .green : .secondary
         }
     }
 
     private var title: String {
         switch tracker.phase {
-        case .findingTable: "Find the table"
-        case .findingBoard(let progress): progress > 0 ? "Board found, hold steady" : "Find the board"
-        case .tappingCorners(let remaining): remaining == 2 ? "Tap the a1 corner" : "Now tap the h8 corner"
+        case .findingTable: tracker.searchHint.title
+        case .findingBoard(let progress): progress > 0 ? "Hold steady" : tracker.searchHint.title
         case .locked:
-            if let square = tracker.selected { "\(square) selected" } else { "Board locked" }
+            if let square = tracker.selected { "\(square) selected" }
+            else {
+                switch tracker.visibility {
+                case .seeing: "Board locked"
+                case .glimpsing: "Board partly hidden"
+                case .notSeen(let seconds): seconds > 1 ? "Holding position" : "Board locked"
+                }
+            }
         }
     }
 
-    private var detail: String {
+    private var subtitle: String {
+        if let note = tracker.trackingNote { return note }
         switch tracker.phase {
-        case .findingTable:
-            return "Sweep the phone slowly across the table."
+        case .findingTable: return tracker.searchHint.advice
         case .findingBoard(let progress):
-            if progress > 0 { return "Locking once it has stayed put for a moment." }
-            if tracker.visibility == .glimpsing { return "Almost, fit the whole board in view." }
-            return "Point at the board with all 64 squares in frame."
-        case .tappingCorners:
-            return "Outer corners of the playing squares, not the rim."
+            if progress > 0 { return "Found it, locking in a moment" }
+            return tracker.searchHint.advice
         case .locked:
-            if tracker.selected != nil { return "Tap another square to draw an arrow, or the same one to cancel." }
-            if !tracker.isManualLock, tracker.calibration < 1 {
-                return "Walk around the board a little to sharpen the fit. Tap squares to draw."
+            if tracker.selected != nil { return "Tap another square to draw an arrow" }
+            if case .notSeen(let seconds) = tracker.visibility, seconds > 1 {
+                return "Lost sight \(seconds)s ago, keeping the last spot"
             }
-            return "Tap a square, then another, to draw an arrow."
+            return "Tap squares to draw arrows"
         }
     }
 }
 
-/// Three dots for table, board, locked, with the current one pulsing.
-private struct StepIndicator: View {
-    let phase: BoardTracker.Phase
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .fill(color.opacity(0.2))
-            Image(systemName: symbol)
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(color)
-                .symbolEffect(.pulse, isActive: isSearching)
-                .contentTransition(.symbolEffect(.replace))
-        }
-        .frame(width: 42, height: 42)
-    }
-
-    private var isSearching: Bool {
-        switch phase {
-        case .findingTable, .findingBoard, .tappingCorners: true
-        case .locked: false
+extension BoardTracker.SearchHint {
+    var title: String {
+        switch self {
+        case .mapTable: "Map the table"
+        case .aimAtTable: "Aim at the board"
+        case .tooFar: "Move closer"
+        case .tooFlat: "Look down more"
+        case .partlyOutOfView: "Fit the whole board"
+        case .unclearSquares: "Looking for squares"
+        case .holdSteady: "Hold steady"
         }
     }
 
-    private var symbol: String {
-        switch phase {
-        case .findingTable: "rectangle.dashed"
-        case .findingBoard: "viewfinder"
-        case .tappingCorners: "hand.tap"
-        case .locked: "checkmark.seal.fill"
+    var advice: String {
+        switch self {
+        case .mapTable: "Move the phone slowly so it can see the table surface"
+        case .aimAtTable: "Point the middle of the screen at the board"
+        case .tooFar: "Get within about an arm's length of the board"
+        case .tooFlat: "Raise the phone so it looks down on the board, not across it"
+        case .partlyOutOfView: "All four corners of the squares need to be on screen"
+        case .unclearSquares: "Keep the board in the middle; more light and less glare help"
+        case .holdSteady: "Found it, locking in a moment"
         }
     }
 
-    private var color: Color {
-        switch phase {
-        case .findingTable: .gray
-        case .findingBoard, .tappingCorners: .orange
-        case .locked: .cyan
+    var symbol: String {
+        switch self {
+        case .mapTable: "rectangle.dashed"
+        case .aimAtTable: "scope"
+        case .tooFar: "arrow.down.right.and.arrow.up.left"
+        case .tooFlat: "arrow.down.to.line"
+        case .partlyOutOfView: "arrow.up.left.and.arrow.down.right"
+        case .unclearSquares: "viewfinder"
+        case .holdSteady: "hand.raised"
         }
     }
 }
 
-private struct Chip: View {
-    let symbol: String
-    let text: String
-    let color: Color
+/// What it takes to lock, with the steps already met ticked off.
+private struct SearchChecklist: View {
+    let tracker: BoardTracker
 
     var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: symbol)
-                .font(.caption2.weight(.bold))
+        VStack(alignment: .leading, spacing: 8) {
+            step("Table mapped", done: tableMapped, active: !tableMapped)
+            step("Whole board on screen, seen from above", done: boardSeen, active: tableMapped && !boardSeen)
+            step("Hold still for a moment", done: false, active: boardSeen, progress: progress)
+        }
+        .font(.subheadline)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 22))
+        .animation(.smooth, value: tableMapped)
+        .animation(.smooth, value: boardSeen)
+    }
+
+    private var tableMapped: Bool { tracker.phase != .findingTable }
+    private var boardSeen: Bool {
+        if case .findingBoard(let progress) = tracker.phase, progress > 0 { return true }
+        return tracker.searchHint == .holdSteady
+    }
+    private var progress: Double? {
+        if case .findingBoard(let progress) = tracker.phase, progress > 0 { return progress }
+        return nil
+    }
+
+    private func step(_ text: String, done: Bool, active: Bool, progress: Double? = nil) -> some View {
+        HStack(spacing: 10) {
+            ZStack {
+                if let progress {
+                    Gauge(value: progress) { EmptyView() }
+                        .gaugeStyle(.accessoryCircularCapacity)
+                        .tint(.green)
+                        .scaleEffect(0.42)
+                } else {
+                    Image(systemName: done ? "checkmark.circle.fill" : (active ? "circle.dotted" : "circle"))
+                        .foregroundStyle(done ? .green : (active ? .orange : .secondary))
+                        .symbolEffect(.rotate, isActive: active)
+                        .contentTransition(.symbolEffect(.replace))
+                }
+            }
+            .frame(width: 22, height: 22)
             Text(text)
-                .font(.caption.weight(.medium))
-                .monospacedDigit()
-                .lineLimit(1)
+                .foregroundStyle(done || active ? .primary : .secondary)
         }
-        .foregroundStyle(color)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(color.opacity(0.16), in: .capsule)
     }
 }
 
-private struct CameraChip: View {
-    let note: String?
+/// Camera-style corner brackets showing where to put the board. They turn
+/// green once the squares are found.
+private struct Reticle: View {
+    let found: Bool
 
     var body: some View {
-        if let note {
-            Chip(symbol: "exclamationmark.triangle.fill", text: note, color: .yellow)
-        } else {
-            Chip(symbol: "camera.fill", text: "Tracking", color: .green)
+        GeometryReader { geometry in
+            let side = min(geometry.size.width, geometry.size.height) * 0.72
+            let arm = side * 0.14
+            Path { path in
+                let rect = CGRect(
+                    x: (geometry.size.width - side) / 2, y: (geometry.size.height - side) / 2 + 50,
+                    width: side, height: side
+                )
+                for (corner, dx, dy) in [
+                    (CGPoint(x: rect.minX, y: rect.minY), 1.0, 1.0), (CGPoint(x: rect.maxX, y: rect.minY), -1.0, 1.0),
+                    (CGPoint(x: rect.maxX, y: rect.maxY), -1.0, -1.0), (CGPoint(x: rect.minX, y: rect.maxY), 1.0, -1.0),
+                ] {
+                    path.move(to: CGPoint(x: corner.x + dx * arm, y: corner.y))
+                    path.addLine(to: corner)
+                    path.addLine(to: CGPoint(x: corner.x, y: corner.y + dy * arm))
+                }
+            }
+            .stroke(found ? Color.green : Color.white.opacity(0.85), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+            .shadow(color: .black.opacity(0.4), radius: 2)
+            .animation(.smooth, value: found)
         }
+        .ignoresSafeArea()
     }
 }
 
-private struct BoardChip: View {
+/// A red dot and elapsed time while the blackbox recorder is running.
+private struct RecordingBadge: View {
+    let started: Date
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle().fill(.red).frame(width: 8, height: 8)
+                .phaseAnimator([1.0, 0.35]) { dot, opacity in dot.opacity(opacity) } animation: { _ in .easeInOut(duration: 0.8) }
+            Text(started, style: .timer)
+                .font(.caption.monospacedDigit().weight(.semibold))
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Recording")
+    }
+}
+
+/// Calibration ring while the height is still being measured, the height
+/// once it's known.
+private struct Accessory: View {
     let tracker: BoardTracker
 
     var body: some View {
-        if tracker.isManualLock {
-            Chip(symbol: "hand.tap.fill", text: "Manual", color: .secondary)
-        } else {
-            switch tracker.visibility {
-            case .seeing:
-                Chip(symbol: "eye.fill", text: tracker.phase == .locked ? "Syncing" : "Seeing", color: .green)
-            case .glimpsing:
-                Chip(symbol: "eye.trianglebadge.exclamationmark", text: "Partial", color: .yellow)
-            case .notSeen(let seconds):
-                Chip(
-                    symbol: "eye.slash",
-                    text: tracker.phase == .locked && seconds > 0 ? "Held \(seconds)s" : "No board",
-                    color: tracker.phase == .locked ? .secondary : .orange
-                )
+        if case .findingBoard(let progress) = tracker.phase, progress > 0 {
+            Gauge(value: progress) { EmptyView() }
+                .gaugeStyle(.accessoryCircularCapacity)
+                .tint(.orange)
+                .scaleEffect(0.6)
+                .frame(width: 34, height: 34)
+        } else if tracker.phase == .locked {
+            if tracker.calibration < 1 {
+                VStack(spacing: 2) {
+                    Gauge(value: tracker.calibration) {
+                        Image(systemName: "figure.walk")
+                    }
+                    .gaugeStyle(.accessoryCircularCapacity)
+                    .tint(.cyan)
+                    .scaleEffect(0.6)
+                    .frame(width: 34, height: 34)
+                    Text("Walk around")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Walk around the board to calibrate, \(Int(tracker.calibration * 100)) percent")
+            } else if let height = tracker.surfaceHeight {
+                Label(String(format: "%.1f cm", height * 100), systemImage: "ruler")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .labelStyle(.titleAndIcon)
             }
         }
     }
 }
 
-private struct HeightChip: View {
+// MARK: Game
+
+private struct GamePanel: View {
     let tracker: BoardTracker
+    @Binding var expanded: Bool
 
     var body: some View {
-        if !tracker.isManualLock, let height = tracker.surfaceHeight {
-            let done = tracker.calibration >= 1
-            Chip(
-                symbol: done ? "ruler.fill" : "arrow.triangle.2.circlepath",
-                text: done
-                    ? String(format: "%.1f cm", height * 100)
-                    : "Calibrating \(Int(tracker.calibration * 100))%",
-                color: done ? .cyan : .secondary
-            )
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: watchSymbol)
+                        .foregroundStyle(watchTint)
+                        .symbolEffect(.pulse, isActive: tracker.watch == .watching)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(watchTitle).font(.subheadline.weight(.semibold))
+                        Text(watchDetail).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if let last = tracker.game.records.last {
+                        Text(last.san)
+                            .font(.subheadline.monospaced().weight(.semibold))
+                            .contentTransition(.numericText())
+                    }
+                    Image(systemName: "chevron.up")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(expanded ? 180 : 0))
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                HStack(alignment: .top, spacing: 12) {
+                    BoardDiagram(position: tracker.game.position, lastMove: tracker.game.lastMove)
+                        .frame(width: 152, height: 152)
+                    MoveList(game: tracker.game)
+                }
+                .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .top)))
+            }
+        }
+        .padding(14)
+        .glassEffect(.regular, in: .rect(cornerRadius: 26))
+        .animation(.smooth, value: tracker.game.records.count)
+    }
+
+    private var watchSymbol: String {
+        switch tracker.watch {
+        case .idle, .findingStart: "checkerboard.rectangle"
+        case .watching: "eye"
+        case .handInView: "hand.raised"
+        case .unclear: "questionmark.circle"
+        }
+    }
+
+    private var watchTint: Color {
+        switch tracker.watch {
+        case .watching: .green
+        case .unclear: .orange
+        default: .secondary
+        }
+    }
+
+    private var watchTitle: String {
+        if let status = tracker.game.status { return status }
+        switch tracker.watch {
+        case .idle, .findingStart: return "Set up the pieces"
+        case .watching: return tracker.game.position.sideToMove == .white ? "White to move" : "Black to move"
+        case .handInView: return "Waiting for hands to clear"
+        case .unclear: return "Couldn't tell what moved"
+        }
+    }
+
+    private var watchDetail: String {
+        switch tracker.watch {
+        case .idle, .findingStart: "Hold still over the starting position"
+        case .watching: "Watching for moves"
+        case .handInView: "Moves are read once nothing is moving"
+        case .unclear: "Undo or fix the position, then try again"
+        }
+    }
+}
+
+private struct BoardDiagram: View {
+    let position: Position
+    let lastMove: Move?
+
+    var body: some View {
+        Grid(horizontalSpacing: 0, verticalSpacing: 0) {
+            ForEach((0..<8).reversed(), id: \.self) { rank in
+                GridRow {
+                    ForEach(0..<8, id: \.self) { file in
+                        let square = Square(file: file, rank: rank)!
+                        ZStack {
+                            Rectangle().fill(color(for: square))
+                            if let piece = position[square] {
+                                Text(piece.symbol)
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(piece.color == .white ? .white : .black)
+                                    .shadow(color: piece.color == .white ? .black.opacity(0.6) : .white.opacity(0.4), radius: 0.5)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .clipShape(.rect(cornerRadius: 8))
+        .accessibilityLabel("Board diagram")
+    }
+
+    private func color(for square: Square) -> Color {
+        if let lastMove, square == lastMove.from || square == lastMove.to {
+            return Color.teal.opacity(square.isLight ? 0.55 : 0.75)
+        }
+        return square.isLight ? Color(white: 0.86) : Color(red: 0.55, green: 0.42, blue: 0.32)
+    }
+}
+
+private struct MoveList: View {
+    let game: Game
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                if game.records.isEmpty {
+                    Text("No moves yet")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 4) {
+                    ForEach(game.numbered, id: \.number) { row in
+                        GridRow {
+                            Text("\(row.number).").foregroundStyle(.secondary)
+                            Text(row.white)
+                            Text(row.black ?? "")
+                        }
+                        .id(row.number)
+                    }
+                }
+                .font(.footnote.monospaced())
+            }
+            .frame(height: 152)
+            .onChange(of: game.records.count) {
+                if let last = game.numbered.last { withAnimation { proxy.scrollTo(last.number, anchor: .bottom) } }
+            }
         }
     }
 }
@@ -275,29 +522,33 @@ private struct DebugPanel: View {
         HStack(alignment: .top, spacing: 12) {
             Group {
                 if let image = tracker.debugImage {
-                    Image(decorative: image, scale: 1)
-                        .resizable()
-                        .interpolation(.medium)
+                    Image(decorative: image, scale: 1).resizable().interpolation(.medium)
                 } else {
-                    Color.black.opacity(0.4)
-                        .overlay(ProgressView())
+                    Color.black.opacity(0.3).overlay(ProgressView())
                 }
             }
-            .frame(width: 140, height: 140)
+            .frame(width: 120, height: 120)
             .clipShape(.rect(cornerRadius: 12))
 
-            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 4) {
+            if let changes = tracker.lastChanges {
+                ChangeMap(changes: changes)
+                    .frame(width: 80, height: 80)
+            }
+
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 3) {
                 row("checker", "\(tracker.lastChecker)/112")
                 row("sightings", "\(tracker.sightings)")
                 row("surface", tracker.surfaceHeight.map { String(format: "+%.1f cm", $0 * 100) } ?? "n/a")
-                row("parallax", String(format: "%.3f", tracker.parallax))
+                row("calibrated", "\(Int(tracker.calibration * 100))%")
+                row("turns", "\(tracker.quarterTurns)")
+                row("fit", tracker.fit.map { String(format: "%.1f", $0) } ?? "n/a")
                 row("captures", "\(tracker.captureCount)")
             }
-            .font(.caption.monospacedDigit())
+            .font(.caption2.monospacedDigit())
             Spacer(minLength: 0)
         }
         .padding(10)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 18))
+        .glassEffect(.regular, in: .rect(cornerRadius: 20))
     }
 
     private func row(_ label: String, _ value: String) -> some View {
@@ -308,113 +559,80 @@ private struct DebugPanel: View {
     }
 }
 
-// MARK: Actions
-
-private struct Toast: View {
-    let text: String
+/// Which squares looked covered at the last still moment, brightest where
+/// a square looked least like bare board.
+private struct ChangeMap: View {
+    let changes: [Float]
 
     var body: some View {
-        Label(text, systemImage: text.hasPrefix("Save failed") ? "xmark.octagon.fill" : "checkmark.circle.fill")
-            .font(.subheadline.weight(.medium))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.ultraThinMaterial, in: .capsule)
+        Grid(horizontalSpacing: 1, verticalSpacing: 1) {
+            ForEach((0..<8).reversed(), id: \.self) { rank in
+                GridRow {
+                    ForEach(0..<8, id: \.self) { file in
+                        Rectangle().fill(Color.orange.opacity(Double(1 - changes[rank * 8 + file])))
+                            .background(Color.black.opacity(0.3))
+                    }
+                }
+            }
+        }
+        .clipShape(.rect(cornerRadius: 6))
     }
 }
 
-private struct ActionBar: View {
+// MARK: Toolbar
+
+private struct Toolbar: View {
     @Bindable var tracker: BoardTracker
 
     var body: some View {
-        HStack(spacing: 4) {
-            if tracker.phase == .locked {
-                action("Rotate", "rotate.right") { tracker.quarterTurns = (tracker.quarterTurns + 1) % 4 }
-                action("Clear", "eraser") { tracker.clearDrawings() }
-            } else {
-                action("Manual", "hand.tap") { tracker.beginCornerTaps() }
-            }
+        GlassEffectContainer(spacing: 16) {
+            HStack(spacing: 16) {
+                Button("Undo move", systemImage: "arrow.uturn.backward") { tracker.undoMove() }
+                    .disabled(tracker.game.records.isEmpty)
 
-            CaptureButton(count: tracker.captureCount) { tracker.capture() }
-                .padding(.horizontal, 8)
-
-            action(tracker.phase == .locked ? "Relock" : "Restart", "arrow.counterclockwise") { tracker.reset() }
-            Menu {
-                Toggle(isOn: $tracker.showsDebug) {
-                    Label("Debug view", systemImage: "ladybug")
-                }
                 Button {
-                    tracker.beginCornerTaps()
+                    tracker.capture()
                 } label: {
-                    Label("Place by tapping corners", systemImage: "hand.tap")
+                    Image(systemName: "camera.fill")
+                        .font(.title2)
+                        .frame(width: 44, height: 44)
                 }
-                Button(role: .destructive) {
-                    tracker.start()
+                .buttonStyle(.glassProminent)
+                .buttonBorderShape(.circle)
+                .tint(.white.opacity(0.9))
+                .foregroundStyle(.black)
+                .accessibilityLabel("Capture frame")
+                .accessibilityValue("\(tracker.captureCount) saved")
+
+                Menu {
+                    Section("Game") {
+                        Button("New game", systemImage: "plus.circle") { tracker.newGame() }
+                        Button("Flip board", systemImage: "arrow.up.arrow.down") { tracker.flip() }
+                        Toggle("Watch for moves", systemImage: "eye", isOn: $tracker.watchesMoves)
+                    }
+                    Section("Board") {
+                        Button("Relock board", systemImage: "arrow.counterclockwise") { tracker.reset() }
+                        Button("Clear arrows", systemImage: "eraser") { tracker.clearDrawings() }
+                    }
+                    Section("Tuning") {
+                        Button(
+                            tracker.isRecording ? "Stop recording" : "Record session",
+                            systemImage: tracker.isRecording ? "stop.circle" : "record.circle"
+                        ) { tracker.toggleRecording() }
+                        Toggle("Debug overlay", systemImage: "ladybug", isOn: $tracker.showsDebug)
+                        Button("Restart AR session", systemImage: "arrow.clockwise", role: .destructive) { tracker.start() }
+                    }
                 } label: {
-                    Label("Restart AR session", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
+                    Image(systemName: "ellipsis")
                 }
-            } label: {
-                ActionLabel(title: "More", symbol: "ellipsis.circle")
+                .accessibilityLabel("More")
             }
-            .tint(.primary)
+            .labelStyle(.iconOnly)
+            .font(.title3)
+            .buttonStyle(.glass)
+            .buttonBorderShape(.circle)
+            .controlSize(.large)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: .capsule)
-    }
-
-    private func action(_ title: String, _ symbol: String, perform: @escaping () -> Void) -> some View {
-        Button(action: perform) {
-            ActionLabel(title: title, symbol: symbol)
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct ActionLabel: View {
-    let title: String
-    let symbol: String
-
-    var body: some View {
-        VStack(spacing: 3) {
-            Image(systemName: symbol)
-                .font(.system(size: 19, weight: .medium))
-                .frame(height: 22)
-            Text(title)
-                .font(.caption2.weight(.medium))
-        }
-        .foregroundStyle(.primary)
-        .frame(width: 58, height: 48)
-        .contentShape(.rect)
-    }
-}
-
-private struct CaptureButton: View {
-    let count: Int
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            ZStack {
-                Circle()
-                    .strokeBorder(.white, lineWidth: 3)
-                Circle()
-                    .fill(.white)
-                    .padding(6)
-            }
-            .frame(width: 60, height: 60)
-            .overlay(alignment: .topTrailing) {
-                if count > 0 {
-                    Text("\(count)")
-                        .font(.caption2.weight(.bold).monospacedDigit())
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(.cyan, in: .capsule)
-                        .offset(x: 6, y: -4)
-                }
-            }
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Capture frame, \(count) saved")
+        .padding(.bottom, 4)
     }
 }

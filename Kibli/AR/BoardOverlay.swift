@@ -101,6 +101,24 @@ final class BoardOverlay {
         arrows.append(arrow)
     }
 
+    private var lastMoveTiles: [ModelEntity] = []
+
+    /// Tints the from and to squares of the last move, separately from the
+    /// user's own drawings.
+    func showLastMove(_ squares: [Square]) {
+        lastMoveTiles.forEach { $0.removeFromParent() }
+        lastMoveTiles = squares.map { square in
+            let size: Float = 1.0 / 8
+            let tile = ModelEntity(
+                mesh: .generatePlane(width: size * 0.96, depth: size * 0.96),
+                materials: [Self.translucent(.systemTeal, opacity: 0.45)]
+            )
+            tile.position = Self.center(of: square) + [0, 0.0015, 0]
+            content.addChild(tile)
+            return tile
+        }
+    }
+
     func clearDrawings() {
         highlights.values.forEach { $0.removeFromParent() }
         highlights.removeAll()
