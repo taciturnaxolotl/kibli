@@ -1,0 +1,34 @@
+name: Kibli
+options:
+  bundleIdPrefix: sh.dunkirk
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: M67B42LX8D
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    SWIFT_OPTIMIZATION_LEVEL: "-O"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  Kibli:
+    type: application
+    platform: iOS
+    sources:
+      - path: Kibli
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: sh.dunkirk.kibli
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Kibli
+        INFOPLIST_KEY_NSCameraUsageDescription: Kibli uses the camera to find your chessboard and draw on it.
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIRequiredDeviceCapabilities: arkit
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_UIStatusBarHidden: YES
+        INFOPLIST_KEY_UIFileSharingEnabled: YES
+        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

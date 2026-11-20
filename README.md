@@ -2,6 +2,28 @@
 
 arkit chess experiments
 
+## building
+
+```sh
+xcodegen generate
+xcodebuild -project Kibli.xcodeproj -scheme Kibli -destination 'id=<device udid>' -derivedDataPath build -allowProvisioningUpdates build
+xcrun devicectl device install app --device <device udid> build/Build/Products/Debug-iphoneos/Kibli.app
+```
+
+## roadmap
+
+- [x] app icon (`tools/make_icon.sh` renders it from `tools/icon.svg`)
+- [x] find the table plane, find the board, lock an anchor, draw a grid, squares, and arrows
+  - the camera image is projected onto the arkit table plane so the board is a flat grid, then the 8x8 window whose squares alternate light/dark best wins (ignores rims, hands and pieces) and its corners snap to the square edges
+  - `tools/grid_proto.py` is the python prototype; `swiftc -O -o /tmp/gridcheck tools/gridcheck/main.swift Kibli/AR/GridFinder.swift Kibli/AR/TopDownImage.swift` runs the swift finder on its dumped test views
+- [x] fuse sightings from different viewpoints to solve for the playing surface height above the table, and keep refining after lock
+- [x] capture button saves the camera frame + intrinsics + camera and board pose; `tools/pull_captures.sh` copies them into `samples/captures`
+- [x] once locked, follow the board by refining the predicted corners (about 4ms) instead of searching again; autofocus and exposure aim at the board
+- [x] `tools/replay` runs saved captures through the real pipeline on the mac: `swiftc -O -o /tmp/replay tools/replay/main.swift Kibli/AR/{GridFinder,TopDownImage,BoardEstimator,BoardPose,BoardSearch}.swift && /tmp/replay`
+- [x] starting position: the frame around the playing area is smooth along its length while the outer files are busy, which pins the grid when only four ranks of squares show
+- [ ] piece detection (occupancy first, then classify, then legal-move matching against frame diffs)
+- [ ] engine (stockfish for analysis, maia for human-like moves)
+
 The canonical repo for this is hosted on tangled over at [`https://tangled.org/dunkirk.sh/kibli`](https://tangled.org/dunkirk.sh/kibli)
 
 <p align="center">
