@@ -77,15 +77,16 @@ for line in try String(contentsOf: root.appendingPathComponent("log.jsonl"), enc
     if simulate {
         let done = DispatchSemaphore(value: 0)
         var result: MoveDetector.Event = .busy
-        let frame = MoveDetector.Frame(luma: plane, intrinsics: intr, camera: cam, board: bp.transform, side: bp.side,
-                                       depth: (r["depth"] as? String).flatMap { depth(root.appendingPathComponent($0)) })
-        _ = detector.process(frame, position: game.position, awaitingStart: game.records.isEmpty && !startConfirmed, findOrientation: false) { event, _ in
-            result = event; done.signal()
+        let frame = MoveDetector.Frame(luma: plane, intrinsics: intr, camera: cam, board: bp.transform, side: bp.side)
+        var seen = MoveDetector.Insight()
+        _ = detector.process(frame, position: game.position, awaitingStart: game.records.isEmpty && !startConfirmed, findOrientation: false) { event, ins in
+            result = event; seen = ins; done.signal()
         }
         done.wait()
         let t = String(format: "%5.1f", wall - start!)
         switch result {
         case .busy: break
+        case .obstructed: print(t, "obstructed")
         case .settled(let fit):
             if game.records.isEmpty { startConfirmed = true }
             var line = t + " settled " + String(format: "%.2f", fit)
@@ -100,7 +101,7 @@ for line in try String(contentsOf: root.appendingPathComponent("log.jsonl"), enc
         case .awaitingStart(let fit): print(t, "awaiting start", String(format: "%.2f", fit))
         case .moved(let moves, _):
             var p = game.position
-            print(t, "MOVED", moves.map { m -> String in defer { p = p.playing(m) }; return p.san(m) })
+            print(t, "leftover", seen.leftover ?? -1, "MOVED", moves.map { m -> String in defer { p = p.playing(m) }; return p.san(m) })
             for m in moves { game.play(m) }
         case .unclear: print(t, "unclear")
         case .ambiguous(let moves):
@@ -115,6 +116,16 @@ for line in try String(contentsOf: root.appendingPathComponent("log.jsonl"), enc
         case .oriented(let q): print(t, "oriented", q)
         }
         continue
+    }
+    if ProcessInfo.processInfo.environment["UNEXPLAINED"] != nil {
+        // Squares the start position (plus the game so far, when simulating)
+        // expects bare that look covered: a resting hand shows up as many.
+        let p = game.position
+        let bare = Occupancy.expectedBare(p, camera: snap.camera)
+        if let looks = Occupancy.bareness(snap, reference: bare) {
+            let n = (0..<64).filter { bare[$0] && snap.visible[$0] > 0.95 && looks[$0] < 0.3 }.count
+            print(String(format: "%6.1f unexplained %d", wall - start!, n))
+        }
     }
     if let at = ProcessInfo.processInfo.environment["SEARCHAT"].flatMap(Double.init), abs(wall - start! - at) < 0.26 {
         let plies = Int(ProcessInfo.processInfo.environment["PLIES"] ?? "6")!

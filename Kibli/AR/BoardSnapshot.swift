@@ -23,7 +23,11 @@ struct BoardSnapshot: Sendable {
     /// square, +x toward the h-file, +y toward rank 8, +z up).
     let camera: SIMD3<Float>
 
-    init?(luma: LumaPlane, intrinsics: simd_float3x3, cameraTransform: simd_float4x4, board: simd_float4x4, side: Float) {
+    /// Fraction of each square hidden behind a hand or arm, when ARKit's
+    /// person mask was available.
+    private(set) var hands: [Float]?
+
+    init?(luma: LumaPlane, intrinsics: simd_float3x3, cameraTransform: simd_float4x4, board: simd_float4x4, side: Float, mask: PersonMask? = nil) {
         let n = Self.size
         let fx = intrinsics.columns.0.x, fy = intrinsics.columns.1.y
         let cx = intrinsics.columns.2.x, cy = intrinsics.columns.2.y
@@ -33,6 +37,7 @@ struct BoardSnapshot: Sendable {
 
         var pixels = [Float](repeating: 0, count: n * n)
         var valid = [Bool](repeating: false, count: n * n)
+        var handCounts = [Int](repeating: 0, count: 64)
         var missing = 0
         let width = luma.width, height = luma.height
         let maxX = Float(width - 2), maxY = Float(height - 2)
@@ -54,11 +59,18 @@ struct BoardSnapshot: Sendable {
                     let bottom = Float(bytes[i + width]) * (1 - ax) + Float(bytes[i + width + 1]) * ax
                     pixels[row * n + col] = top * (1 - ay) + bottom * ay
                     valid[row * n + col] = true
+                    if let mask, mask.isPerson(u: u, v: v, imageWidth: width) {
+                        handCounts[(7 - row / Self.squarePixels) * 8 + col / Self.squarePixels] += 1
+                    }
                 }
             }
         }
         guard missing < n * n / 2 else { return nil }
         self.valid = valid
+        if mask != nil {
+            let perSquare = Float(Self.squarePixels * Self.squarePixels)
+            hands = handCounts.map { Float($0) / perSquare }
+        }
 
         // Divide out overall brightness so auto exposure doesn't look like
         // every square changing at once.

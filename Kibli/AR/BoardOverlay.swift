@@ -120,22 +120,45 @@ final class BoardOverlay {
         return arrow
     }
 
-    private var lastMoveTiles: [ModelEntity] = []
+    private var lastMoveEntities: [Entity] = []
 
-    /// Tints the from and to squares of the last move, separately from the
-    /// user's own drawings.
-    func showLastMove(_ squares: [Square]) {
-        lastMoveTiles.forEach { $0.removeFromParent() }
-        lastMoveTiles = squares.map { square in
-            let size: Float = 1.0 / 8
-            let tile = ModelEntity(
-                mesh: .generatePlane(width: size * 0.96, depth: size * 0.96),
-                materials: [Self.translucent(.systemTeal, opacity: 0.45)]
-            )
+    /// Marks the last move on the board: soft tiles on both squares, an arrow
+    /// between them, and a ring that pops out from the destination when the
+    /// move is first read.
+    func showLastMove(_ move: Move?) {
+        lastMoveEntities.forEach { $0.removeFromParent() }
+        lastMoveEntities = []
+        guard let move else { return }
+        let size: Float = 1.0 / 8
+        let tint = UIColor.systemTeal
+
+        for (square, opacity) in [(move.from, Float(0.25)), (move.to, Float(0.45))] {
+            let tile = ModelEntity(mesh: .generatePlane(width: size * 0.94, depth: size * 0.94, cornerRadius: size * 0.12),
+                                   materials: [Self.translucent(tint, opacity: opacity)])
             tile.position = Self.center(of: square) + [0, 0.0015, 0]
             content.addChild(tile)
-            return tile
+            lastMoveEntities.append(tile)
         }
+
+        if let arrow = makeArrow(from: move.from, to: move.to, color: tint) {
+            // Grow out of the starting square.
+            let final = arrow.transform
+            var start = final
+            start.scale = [0.05, 1, 0.05]
+            arrow.transform = start
+            content.addChild(arrow)
+            arrow.move(to: final, relativeTo: arrow.parent, duration: 0.35, timingFunction: .easeOut)
+            lastMoveEntities.append(arrow)
+        }
+
+        let ring = ModelEntity(mesh: .generatePlane(width: size, depth: size, cornerRadius: size / 2),
+                               materials: [Self.translucent(.white, opacity: 0.6)])
+        ring.position = Self.center(of: move.to) + [0, 0.003, 0]
+        content.addChild(ring)
+        var grown = ring.transform
+        grown.scale = [2.2, 1, 2.2]
+        ring.move(to: grown, relativeTo: ring.parent, duration: 0.5, timingFunction: .easeOut)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { ring.removeFromParent() }
     }
 
     func clearDrawings() {

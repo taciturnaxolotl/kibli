@@ -22,6 +22,9 @@ final class MoveDetector: @unchecked Sendable {
         /// board looks empty or set up for a new game instead.
         case cleared
         case newGame
+        /// Still, but something resting on the board (a hand or sleeve)
+        /// covers squares no move explains. Treated like `busy`.
+        case obstructed
         /// Waiting for the starting position to appear.
         case awaitingStart(fit: Float)
         /// Something moved, but from this angle two or more legal moves look
@@ -38,13 +41,35 @@ final class MoveDetector: @unchecked Sendable {
     /// How clearly the empty board or the start has to fit to reset the game.
     var resetFit: Float = 0.75
 
+    /// What the detector saw at its last check, for the debug view.
+    struct Insight: Sendable {
+        /// 0 to 1: how far through the "board has been still" wait it is.
+        var settle: Double = 0
+        /// Typical change on bare squares since the previous frame.
+        var motion: Float = 0
+        /// Fit of the position being followed, if checked.
+        var current: Float?
+        /// Best fitting legal moves from that position, best first.
+        var ranked: [(san: String, from: Square, to: Square, fit: Float)] = []
+        /// Per square, how much it looked like bare board, 0 to 1.
+        var bareness: [Float]?
+        /// Per square, -1 black piece to +1 white piece.
+        var colors: [Float]?
+        /// Per square, whether the followed position expects bare board.
+        var expectedBare: [Bool]?
+        /// Covered squares left unexplained by the best move.
+        var leftover: Int?
+        /// Per square, how much of it a hand or arm hides.
+        var hands: [Float]?
+    }
+
     struct Frame: Sendable {
         let luma: LumaPlane
         let intrinsics: simd_float3x3
         let camera: simd_float4x4
         let board: simd_float4x4
         let side: Float
-        var depth: DepthPlane?
+        var mask: PersonMask?
     }
 
     /// Change in bare squares between frames, in normalized luma units, that
@@ -68,6 +93,7 @@ final class MoveDetector: @unchecked Sendable {
     /// A move has to win two still checks in a row before it's accepted.
     private var candidate: [Move]?
     private var mismatches = 0
+    private var insight = Insight()
 
     func reset() {
         queue.async { [self] in
@@ -80,7 +106,7 @@ final class MoveDetector: @unchecked Sendable {
 
     /// Returns false without doing anything if the last frame is still being
     /// processed.
-    func process(_ frame: Frame, position: Position, awaitingStart: Bool, findOrientation: Bool, completion: @escaping @Sendable (Event, _ depthOccupancy: [Float?]?) -> Void) -> Bool {
+    func process(_ frame: Frame, position: Position, awaitingStart: Bool, findOrientation: Bool, completion: @escaping @Sendable (Event, Insight) -> Void) -> Bool {
         lock.lock()
         if busy {
             lock.unlock()
@@ -91,17 +117,17 @@ final class MoveDetector: @unchecked Sendable {
 
         queue.async { [self] in
             var event = Event.busy
-            var depthOccupancy: [Float?]?
-            if var snapshot = BoardSnapshot(
+            insight = Insight()
+            if let snapshot = BoardSnapshot(
                 luma: frame.luma, intrinsics: frame.intrinsics, cameraTransform: frame.camera,
-                board: frame.board, side: frame.side
+                board: frame.board, side: frame.side, mask: frame.mask
             ) {
-                snapshot.heights = !Occupancy.useDepth ? nil : frame.depth?.squareHeights(
-                    imageIntrinsics: frame.intrinsics, imageWidth: frame.luma.width,
-                    cameraTransform: frame.camera, board: frame.board, side: frame.side
-                )
                 event = handle(snapshot, position: position, awaitingStart: awaitingStart)
-                depthOccupancy = snapshot.heights.flatMap { Occupancy.occupancy(fromHeights: $0, position: position) }
+                insight.settle = min(Double(still.count) / Double(framesToSettle), 1)
+                let bare = Occupancy.expectedBare(position, camera: snapshot.camera)
+                insight.expectedBare = bare
+                insight.bareness = Occupancy.bareness(snapshot, reference: bare)
+                insight.colors = Occupancy.pieceColor(snapshot, reference: bare)
                 if findOrientation, case .settled = event, let turns = snapshot.startOrientation() {
                     event = .oriented(quarterTurns: turns)
                 }
@@ -109,7 +135,7 @@ final class MoveDetector: @unchecked Sendable {
             lock.lock()
             busy = false
             lock.unlock()
-            completion(event, depthOccupancy)
+            completion(event, insight)
         }
         return true
     }
@@ -124,17 +150,27 @@ final class MoveDetector: @unchecked Sendable {
             let now = snapshot.squareStats(), then = previous.squareStats()
             let changes = (0..<64).filter { bare[$0] && snapshot.visible[$0] > 0.95 && previous.visible[$0] > 0.95 }.map { abs(now[$0].mean - then[$0].mean) }.sorted()
             let typical = changes.isEmpty ? 0 : changes[changes.count * 3 / 4]
+            insight.motion = typical
             if typical > motionThreshold {
                 still = []
                 candidate = nil
                 return .busy
             }
         }
+        insight.hands = snapshot.hands
+        // A hand over the board, even holding still, means a move is under
+        // way or someone is pointing; don't read anything until it's gone.
+        if let hands = snapshot.hands, hands.contains(where: { $0 > handCoverage }) {
+            still = []
+            candidate = nil
+            return .obstructed
+        }
         still.append(snapshot)
         if still.count > framesToSettle { still.removeFirst() }
         guard still.count >= framesToSettle else { return .busy }
 
         let current = averageFit(position)
+        insight.current = current
         let observed = averageBareness(position) ?? []
 
         // First make sure the game being followed is what's on the board.
@@ -151,6 +187,10 @@ final class MoveDetector: @unchecked Sendable {
             return turns == 0 ? .settled(fit: upright) : .oriented(quarterTurns: turns)
         }
         if current < mismatchFit {
+            if unexplained(position) > handSquares + 2 {
+                mismatches = 0
+                return .obstructed
+            }
             mismatches += 1
             guard mismatches >= 2 else { return .busy }
             if averageFit(Occupancy.empty) >= resetFit { mismatches = 0; return .cleared }
@@ -172,11 +212,18 @@ final class MoveDetector: @unchecked Sendable {
             .filter { $0.promotion == nil || $0.promotion == .queen }
             .map { (move: $0, fit: averageFit(position.playing($0))) }
             .sorted { $0.fit > $1.fit }
+        insight.ranked = ranked.prefix(5).map { (position.san($0.move), $0.move.from, $0.move.to, $0.fit) }
         guard let best = ranked.first, best.fit >= matchFit, best.fit > current + margin else {
             candidate = nil
             return .settled(fit: current)
         }
         let tied = ranked.prefix { best.fit - $0.fit < tieMargin && $0.fit > current + margin }.map(\.move)
+        let leftover = unexplained(position.playing(best.move))
+        insight.leftover = leftover
+        if leftover > handSquares {
+            candidate = nil
+            return .obstructed
+        }
         // Either way, the same answer has to come up twice in a row.
         guard candidate == tied else {
             candidate = tied
@@ -201,6 +248,26 @@ final class MoveDetector: @unchecked Sendable {
         }
         return Position(board: board)
     }()
+
+    /// Squares `position` says should be bare that look covered in every
+    /// still frame. A real move leaves none once it's played; a hand or
+    /// sleeve resting on the board covers several bare squares that no move
+    /// explains.
+    private func unexplained(_ position: Position) -> Int {
+        guard !still.isEmpty else { return 0 }
+        var covered = [Bool](repeating: true, count: 64)
+        for snapshot in still {
+            let bare = Occupancy.expectedBare(position, camera: snapshot.camera)
+            guard let looks = Occupancy.bareness(snapshot, reference: bare) else { return 0 }
+            for i in 0..<64 where !(bare[i] && snapshot.visible[i] > 0.95 && looks[i] < 0.3) { covered[i] = false }
+        }
+        return covered.filter { $0 }.count
+    }
+
+    /// More unexplained squares than this means something is in the way.
+    var handSquares = 2
+    /// Share of a square a hand must hide to count as being over the board.
+    var handCoverage: Float = 0.15
 
     private func averageFit(_ position: Position) -> Float {
         let fits = still.compactMap { Occupancy.fit(position, $0) }
