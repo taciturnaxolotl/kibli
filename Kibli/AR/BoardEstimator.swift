@@ -42,15 +42,24 @@ struct BoardEstimator {
 
     /// ARKit's map drifts by a centimeter or two over half a minute, so old
     /// sightings go stale.
-    var window: TimeInterval = 8
-    var maxObservations = 60
+    var window: TimeInterval = 20
+    var maxObservations = 90
     /// Assumed surface height above the table before there is parallax to
     /// measure, and how strongly to lean on that guess.
     var priorHeight: Float = 0.015
-    var priorWeight: Float = 0.1
-    var heightRange: ClosedRange<Float> = -0.01...0.10
+    var heightRange: ClosedRange<Float> = -0.01...0.12
 
     mutating func reset() { observations.removeAll() }
+
+    /// Moves every sighting sideways, for when the board turns out to have
+    /// been locked a square off.
+    mutating func shift(by offset: SIMD3<Float>) {
+        observations = observations.map { o in
+            var moved = BoardObservation(corners: o.corners.map { $0 + offset }, planeY: o.planeY, camera: o.camera)
+            moved.time = o.time
+            return moved
+        }
+    }
 
     mutating func add(_ observation: BoardObservation) {
         observations.append(observation)
@@ -70,24 +79,43 @@ struct BoardEstimator {
     }
 
     /// Height of the playing surface in world y.
-    func height() -> Float? {
-        guard let reference = observations.last?.planeY else { return nil }
-        let used = inliers()
-        guard !used.isEmpty else { return nil }
+    ///
+    /// Tries every height in `heightRange` and keeps the one where the
+    /// sightings agree best, measured by the median distance of each
+    /// corrected center from their median. Medians shrug off sightings where
+    /// the grid slid a square, so no outlier pass is needed first, and a
+    /// starting guess that's far off (a board on its box sits 6 cm up) can't
+    /// throw away the very sightings that would correct it. A small pull
+    /// toward `priorHeight` decides when there's no viewpoint variety yet.
+    func height() -> Float? { fit()?.y }
 
-        // Each sighting's center moves as q + Y * d with Y the absolute height.
-        let d = used.map { avg($0.slopes) }
-        let q = zip(used, d).map { avg($0.corners) - $0.planeY * $1 }
-        let qMean = avg(q), dMean = avg(d)
-        var numerator: Float = 0, denominator: Float = 0
-        for (qi, di) in zip(q, d) {
-            numerator += simd_dot(qi - qMean, di - dMean)
-            denominator += simd_length_squared(di - dMean)
+    private func fit() -> (y: Float, kept: [BoardObservation])? {
+        guard let reference = observations.last?.planeY, !observations.isEmpty else { return nil }
+        // Center and slope per sighting, measured from its own plane.
+        let centers = observations.map { avg($0.corners) }
+        let slopes = observations.map { avg($0.slopes) }
+        let planes = observations.map(\.planeY)
+
+        func spread(_ h: Float) -> (cost: Float, points: [SIMD2<Float>], median: SIMD2<Float>) {
+            let points = (0..<centers.count).map { i -> SIMD2<Float> in
+                let c = centers[i] + slopes[i] * (reference + h - planes[i])
+                return SIMD2(c.x, c.z)
+            }
+            let median = SIMD2(points.map(\.x).sorted()[points.count / 2], points.map(\.y).sorted()[points.count / 2])
+            let distances = points.map { simd_distance($0, median) }.sorted()
+            return (distances[distances.count / 2], points, median)
         }
-        let prior = reference + priorHeight
-        let n = Float(used.count)
-        let y = (priorWeight * n * prior - numerator) / (priorWeight * n + denominator)
-        return min(max(y, reference + heightRange.lowerBound), reference + heightRange.upperBound)
+
+        var best: (h: Float, cost: Float)?
+        for h in stride(from: heightRange.lowerBound, through: heightRange.upperBound, by: 0.0025) {
+            // 1 cm of departure from the prior costs as much as 0.5 mm of spread.
+            let cost = spread(h).cost + 0.05 * abs(h - priorHeight)
+            if best == nil || cost < best!.cost { best = (h, cost) }
+        }
+        guard let best else { return nil }
+        let chosen = spread(best.h)
+        let kept = zip(observations, chosen.points).filter { simd_distance($1, chosen.median) < 0.025 }.map(\.0)
+        return (reference + best.h, kept.isEmpty ? observations : kept)
     }
 
     /// The fused pose, keeping `yaw` within a quarter turn of `referenceYaw`
@@ -109,18 +137,9 @@ struct BoardEstimator {
         )
     }
 
-    /// Drops sightings whose center is far from the median, such as a frame
-    /// where a hand hid a row and the grid slid over by a square.
+    /// Sightings that agree with the others at the fitted height.
     private func inliers() -> [BoardObservation] {
-        guard observations.count >= 3 else { return observations }
-        let centers = observations.map { avg($0.corners(atHeight: $0.planeY + priorHeight)) }
-        let median = SIMD3(
-            centers.map(\.x).sorted()[centers.count / 2],
-            centers.map(\.y).sorted()[centers.count / 2],
-            centers.map(\.z).sorted()[centers.count / 2]
-        )
-        let kept = zip(observations, centers).filter { simd_distance($1, median) < 0.06 }.map(\.0)
-        return kept.isEmpty ? observations : kept
+        fit()?.kept ?? observations
     }
 }
 

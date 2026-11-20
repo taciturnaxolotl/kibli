@@ -75,11 +75,31 @@ final class BoardOverlay {
     }
 
     func addArrow(from: Square, to: Square, color: UIColor = .systemGreen) {
+        if let arrow = makeArrow(from: from, to: to, color: color) {
+            content.addChild(arrow)
+            arrows.append(arrow)
+        }
+    }
+
+    private var choiceArrows: [Entity] = []
+
+    /// Draws the candidate moves when the camera can't tell them apart,
+    /// each in its own colour so it can be matched to its button.
+    func showChoices(_ choices: [(from: Square, to: Square, color: UIColor)]) {
+        choiceArrows.forEach { $0.removeFromParent() }
+        choiceArrows = choices.compactMap { choice in
+            let arrow = makeArrow(from: choice.from, to: choice.to, color: choice.color)
+            arrow.map { content.addChild($0) }
+            return arrow
+        }
+    }
+
+    private func makeArrow(from: Square, to: Square, color: UIColor) -> Entity? {
         let start = Self.center(of: from)
         let end = Self.center(of: to)
         let delta = end - start
         let length = simd_length(delta)
-        guard length > 0 else { return }
+        guard length > 0 else { return nil }
 
         let material = Self.translucent(color, opacity: 0.85)
         let headLength: Float = 0.045
@@ -97,8 +117,7 @@ final class BoardOverlay {
 
         arrow.position = start + [0, 0.01, 0]
         arrow.orientation = simd_quatf(angle: atan2(-delta.x, -delta.z), axis: [0, 1, 0])
-        content.addChild(arrow)
-        arrows.append(arrow)
+        return arrow
     }
 
     private var lastMoveTiles: [ModelEntity] = []
@@ -164,13 +183,21 @@ final class BoardOverlay {
             label.position = [-0.56, 0.002, 0.5 - (Float(rank) + 0.5) / 8]
             content.addChild(label)
         }
+        // Which side is whose, outside the file letters and beyond rank 8.
+        let white = Self.textEntity("WHITE", material: UnlitMaterial(color: .white), size: 0.06)
+        white.position = [0, 0.002, 0.64]
+        content.addChild(white)
+        let black = Self.textEntity("BLACK", material: UnlitMaterial(color: UIColor(white: 0.15, alpha: 1)), size: 0.06)
+        black.position = [0, 0.002, -0.58]
+        black.orientation = simd_quatf(angle: .pi, axis: [0, 1, 0]) * black.orientation
+        content.addChild(black)
     }
 
-    private static func textEntity(_ string: String, material: UnlitMaterial) -> Entity {
+    private static func textEntity(_ string: String, material: UnlitMaterial, size: CGFloat = 0.05) -> Entity {
         let mesh = MeshResource.generateText(
             string,
             extrusionDepth: 0.001,
-            font: .systemFont(ofSize: 0.05, weight: .semibold),
+            font: .systemFont(ofSize: size, weight: .semibold),
             alignment: .center
         )
         let model = ModelEntity(mesh: mesh, materials: [material])

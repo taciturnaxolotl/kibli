@@ -19,6 +19,10 @@ struct GridFinder: Sendable {
         let checker: Int
         /// Mean signed contrast across interior grid lines, in luma units.
         let edge: Float
+        /// The full board score: checker pattern, minus pattern spilling past
+        /// the edge, plus a plain frame around it. Unlike `checker`, this
+        /// tells a grid on the board from one shifted by a square.
+        var score: Float = 0
     }
 
     var minSquareMeters: Float = 0.022
@@ -124,7 +128,23 @@ struct GridFinder: Sendable {
                 best = (score.score, score.checker, refined.corners, refined.edge)
             }
         }
-        return Result(corners: best!.corners, checker: best!.checker, edge: best!.edge)
+        return Result(corners: best!.corners, checker: best!.checker, edge: best!.edge, score: best!.score)
+    }
+
+    /// Board score for the grid at `corners` and for the same grid moved one
+    /// square in each direction, in `shifts` order. Used to notice a lock
+    /// that sits a square off: one frame's opinion is noisy, but adding these
+    /// up over a few seconds of different viewpoints is not.
+    static let shifts: [SIMD2<Float>] = [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]
+
+    static func shiftScores(_ image: TopDownImage, corners: [SIMD2<Float>], threshold: Float = 12, flatVariance: Float = 30) -> [Float] {
+        let pixels = filled(image)
+        let h = Homography(unitSquareTo: corners, scale: 8)
+        let unit: [SIMD2<Float>] = [[0, 0], [8, 0], [8, 8], [0, 8]]
+        return shifts.map { shift in
+            let moved = unit.map { h.apply($0 + shift) }
+            return boardScore(pixels, valid: image.valid, size: image.size, corners: moved, threshold: threshold, flatVariance: flatVariance).score
+        }
     }
 
     /// Full-resolution score for an 8x8 board at `corners`: alternating pairs
@@ -300,11 +320,11 @@ struct GridFinder: Sendable {
         let refined = Self.refine(fine, size: image.size, corners: predicted)
         let drift = zip(refined.corners, predicted).map { simd_distance($0, $1) }.max() ?? 0
         guard drift * image.metersPerPixel < 0.03 else { return nil }
-        let checker = Self.boardScore(
+        let scored = Self.boardScore(
             fine, valid: image.valid, size: image.size, corners: refined.corners,
             threshold: contrastThreshold, flatVariance: flatVariance
-        ).checker
-        return Result(corners: refined.corners, checker: checker, edge: refined.edge)
+        )
+        return Result(corners: refined.corners, checker: scored.checker, edge: refined.edge, score: scored.score)
     }
 
     private struct Candidate {

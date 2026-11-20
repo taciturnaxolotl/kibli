@@ -180,6 +180,7 @@ private struct StatusBar: View {
             return tracker.searchHint.advice
         case .locked:
             if tracker.selected != nil { return "Tap another square to draw an arrow" }
+            if tracker.viewTooLow { return "Raise the phone to look down on the board; pieces read better from above" }
             if case .notSeen(let seconds) = tracker.visibility, seconds > 1 {
                 return "Lost sight \(seconds)s ago, keeping the last spot"
             }
@@ -395,6 +396,22 @@ private struct GamePanel: View {
             }
             .buttonStyle(.plain)
 
+            if !tracker.choices.isEmpty {
+                HStack(spacing: 8) {
+                    ForEach(Array(tracker.choices.enumerated()), id: \.element.san) { index, choice in
+                        Button {
+                            tracker.choose(choice.move)
+                        } label: {
+                            Text("\(choice.san)  \(choice.move.from)→\(choice.move.to)")
+                                .font(.subheadline.monospaced().weight(.semibold))
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(Color(BoardTracker.choiceColors[index % BoardTracker.choiceColors.count]))
+                    }
+                }
+                .transition(.blurReplace)
+            }
+
             if expanded {
                 HStack(alignment: .top, spacing: 12) {
                     BoardDiagram(position: tracker.game.position, lastMove: tracker.game.lastMove)
@@ -411,17 +428,18 @@ private struct GamePanel: View {
 
     private var watchSymbol: String {
         switch tracker.watch {
-        case .idle, .findingStart: "checkerboard.rectangle"
+        case .idle, .findingStart, .boardEmpty: "checkerboard.rectangle"
         case .watching: "eye"
         case .handInView: "hand.raised"
         case .unclear: "questionmark.circle"
+        case .choosing: "hand.point.up.left"
         }
     }
 
     private var watchTint: Color {
         switch tracker.watch {
         case .watching: .green
-        case .unclear: .orange
+        case .unclear, .choosing: .orange
         default: .secondary
         }
     }
@@ -430,18 +448,22 @@ private struct GamePanel: View {
         if let status = tracker.game.status { return status }
         switch tracker.watch {
         case .idle, .findingStart: return "Set up the pieces"
+        case .boardEmpty: return "Board is empty"
         case .watching: return tracker.game.position.sideToMove == .white ? "White to move" : "Black to move"
         case .handInView: return "Waiting for hands to clear"
         case .unclear: return "Couldn't tell what moved"
+        case .choosing: return "Which move was it?"
         }
     }
 
     private var watchDetail: String {
         switch tracker.watch {
-        case .idle, .findingStart: "Hold still over the starting position"
+        case .idle, .findingStart: "Moves are followed once the starting position is seen"
+        case .boardEmpty: "Set up the pieces to start a new game"
         case .watching: "Watching for moves"
         case .handInView: "Moves are read once nothing is moving"
         case .unclear: "Undo or fix the position, then try again"
+        case .choosing: "Match the coloured arrow on the board, or step to the side to see"
         }
     }
 }
@@ -591,6 +613,7 @@ private struct ChangeMap: View {
 
 private struct Toolbar: View {
     @Bindable var tracker: BoardTracker
+    @State private var confirmingStartOver = false
 
     var body: some View {
         GlassEffectContainer(spacing: 16) {
@@ -613,13 +636,18 @@ private struct Toolbar: View {
                 .accessibilityValue("\(tracker.captureCount) saved")
 
                 Menu {
+                    Section {
+                        Button("Start over", systemImage: "arrow.counterclockwise.circle", role: .destructive) {
+                            confirmingStartOver = true
+                        }
+                    }
                     Section("Game") {
                         Button("New game", systemImage: "plus.circle") { tracker.newGame() }
                         Button("Flip board", systemImage: "arrow.up.arrow.down") { tracker.flip() }
                         Toggle("Watch for moves", systemImage: "eye", isOn: $tracker.watchesMoves)
                     }
                     Section("Board") {
-                        Button("Relock board", systemImage: "arrow.counterclockwise") { tracker.reset() }
+                        Button("Find board again", systemImage: "viewfinder") { tracker.reset() }
                         Button("Clear arrows", systemImage: "eraser") { tracker.clearDrawings() }
                     }
                     Section("Tuning") {
@@ -628,12 +656,16 @@ private struct Toolbar: View {
                             systemImage: tracker.isRecording ? "stop.circle" : "record.circle"
                         ) { tracker.toggleRecording() }
                         Toggle("Debug overlay", systemImage: "ladybug", isOn: $tracker.showsDebug)
-                        Button("Restart AR session", systemImage: "arrow.clockwise", role: .destructive) { tracker.start() }
                     }
                 } label: {
                     Image(systemName: "ellipsis")
                 }
                 .accessibilityLabel("More")
+                .confirmationDialog("Start over?", isPresented: $confirmingStartOver, titleVisibility: .visible) {
+                    Button("Start over", role: .destructive) { tracker.startOver() }
+                } message: {
+                    Text("Clears the game and the board lock, and remaps the table. Recordings and captures are kept.")
+                }
             }
             .labelStyle(.iconOnly)
             .font(.title3)

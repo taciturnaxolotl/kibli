@@ -71,7 +71,7 @@ for name in try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted
             }
             print("   \(rank + 1) " + row.joined(separator: " "))
         }
-        print(String(format: "  agreement with %@: %.1f", fen == nil ? "start" : "given", Occupancy.agreement(bare, observed)))
+        print(String(format: "  agreement with %@: %.1f  fit %.2f  empty fit %.2f", fen == nil ? "start" : "given", Occupancy.agreement(bare, observed), Occupancy.fit(position, snap) ?? -9, Occupancy.fit(Occupancy.empty, snap) ?? -9))
         // Compare against every legal move from the start, to see how sharp it is.
         var scores: [(Float, String)] = []
         for move in position.legalMoves() {

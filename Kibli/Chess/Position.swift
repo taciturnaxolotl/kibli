@@ -129,6 +129,10 @@ struct Position: Sendable, Hashable {
 
     // MARK: Making moves
 
+    func playing(_ moves: [Move]) -> Position {
+        moves.reduce(self) { $0.playing($1) }
+    }
+
     func playing(_ move: Move) -> Position {
         var next = self
         let piece = self[move.from]!

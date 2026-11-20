@@ -47,6 +47,9 @@ final class BoardTracker {
     }
 
     private(set) var searchHint: SearchHint = .mapTable
+    /// True while locked and looking across the board at a low angle, where
+    /// tall pieces lean over the squares behind them and moves get ambiguous.
+    private(set) var viewTooLow = false
     /// Sightings currently feeding the fused pose.
     private(set) var sightings = 0
     /// Bumped on every lock, so the view can play a haptic.
@@ -70,9 +73,13 @@ final class BoardTracker {
         case idle
         /// Waiting for a still view of the starting position.
         case findingStart
+        /// The board is empty; the game resets when pieces are set up.
+        case boardEmpty
         case watching
         case handInView
         case unclear
+        /// A move was seen but it could be one of `choices`.
+        case choosing
     }
 
     private(set) var game = Game()
@@ -85,6 +92,16 @@ final class BoardTracker {
     private(set) var fit: Float?
     /// Bumped whenever a move is recognized.
     private(set) var moveCount = 0
+    /// Moves the board could show, when the camera can't tell them apart.
+    private(set) var choices: [(move: Move, san: String)] = [] {
+        didSet {
+            overlay.showChoices(choices.enumerated().map { i, choice in
+                (choice.move.from, choice.move.to, Self.choiceColors[i % Self.choiceColors.count])
+            })
+        }
+    }
+    /// Arrow colours for `choices`, in order; the buttons use the same ones.
+    static let choiceColors: [UIColor] = [.systemPink, .systemBlue, .systemYellow]
     /// Bumped whenever the locked board jumps to follow the real one.
     private(set) var relockCount = 0
     private(set) var hasDepth = false
@@ -104,9 +121,32 @@ final class BoardTracker {
     private(set) var recordingStarted: Date?
     @ObservationIgnored private var lastMoveCheck: TimeInterval = 0
     @ObservationIgnored private var needsOrientation = true
+    /// The starting position has been seen on the board, so the game being
+    /// followed is real. Until then no moves are read.
+    @ObservationIgnored private var startConfirmed = false
     /// Locked-mode refinements in a row that couldn't find the board where
     /// it was expected. After a few, search the whole view again.
     @ObservationIgnored private var trackingMisses = 0
+    @ObservationIgnored private var lastEstimatorAdd: TimeInterval = 0
+    /// Refining the locked board can't notice that it's a whole square off,
+    /// since a shifted grid still looks like a checkerboard. A full search
+    /// every so often is the second opinion that can.
+    @ObservationIgnored private var lastFreshSearch: TimeInterval = 0
+    private let freshSearchInterval: TimeInterval = 1.0
+    /// Full board score of the locked board in recent refinements.
+    @ObservationIgnored private var lockedScore: Float = 0
+    @ObservationIgnored private var freshSearches = 0
+    /// Decaying average, per one-square shift, of how much better the board
+    /// scores moved that way, plus how often it was better at all.
+    @ObservationIgnored private var shiftLead = [Float](repeating: 0, count: 4)
+    @ObservationIgnored private var shiftWins = [Float](repeating: 0, count: 4)
+    @ObservationIgnored private var lastShiftUpdate: TimeInterval?
+    private let shiftThreshold: Float = 60
+    /// How far the board appears from the world-fixed estimate in the latest
+    /// frames: ARKit's per-frame camera error, a slightly tilted board, and
+    /// whatever height error is left. Added on top when drawing.
+    @ObservationIgnored private var displayOffset: (center: SIMD3<Float>, yaw: Float, side: Float) = (.zero, 0, 0)
+    @ObservationIgnored private var lastOffsetUpdate: TimeInterval = 0
     /// Camera distance and viewing angle (degrees above the table) for the
     /// last search, used to explain why it failed.
     @ObservationIgnored private var lastSearchGeometry: (distance: Float, elevation: Float)?
@@ -125,7 +165,12 @@ final class BoardTracker {
     @ObservationIgnored private var lastGlimpse: TimeInterval?
 
     private let detectionInterval: TimeInterval = 0.1
-    private let lockedDetectionInterval: TimeInterval = 0.25
+    /// Locked tracking runs fast because the drawn board is snapped to what
+    /// the camera sees each time; a correction even half a second old is no
+    /// better than none once the phone is moving.
+    private let lockedDetectionInterval: TimeInterval = 1.0 / 15
+    /// The world-fixed estimate only needs a few sightings a second.
+    private let estimatorInterval: TimeInterval = 0.25
     private let samplesToLock = 6
     private let stabilityWindow: TimeInterval = 2.5
     private let stabilityTolerance: Float = 0.012
@@ -142,6 +187,7 @@ final class BoardTracker {
     }
 
     func start() {
+        recorder.log("user", ["action": "restartSession"])
         guard let session = arView?.session else { return }
         let configuration = ARWorldTrackingConfiguration()
         configuration.planeDetection = [.horizontal]
@@ -193,18 +239,49 @@ final class BoardTracker {
         recordingStarted = recorder.startedAt
     }
 
+    /// Forgets the game but keeps the board where it is. Waits to see the
+    /// starting position again before reading moves.
     func newGame() {
         recorder.log("user", ["action": "newGame"])
+        clearGame()
+        watch = phase == .locked ? .findingStart : .idle
+    }
+
+    /// Forgets everything: the game, which side is white, the board lock,
+    /// arrows, and ARKit's map of the room. The same as relaunching.
+    func startOver() {
+        recorder.log("user", ["action": "startOver"])
+        clearGame()
+        quarterTurns = 0
+        start()
+    }
+
+    private func clearGame() {
         game = Game()
+        startConfirmed = false
         needsOrientation = true
+        choices = []
         lastChanges = nil
+        lastDepthOccupancy = nil
+        fit = nil
         moveDetector.reset()
         overlay.showLastMove([])
-        watch = phase == .locked ? .findingStart : .idle
+    }
+
+    /// The user picked which of the look-alike moves was played.
+    func choose(_ move: Move) {
+        recorder.log("user", ["action": "choose", "san": game.position.san(move)])
+        game.play(move)
+        choices = []
+        moveCount += 1
+        overlay.showLastMove([move.from, move.to])
+        moveDetector.reset()
+        setWatch(.watching)
     }
 
     func undoMove() {
         recorder.log("user", ["action": "undo"])
+        choices = []
         game.undo()
         moveDetector.reset()
         overlay.showLastMove(game.lastMove?.touched.prefix(2).map { $0 } ?? [])
@@ -236,11 +313,17 @@ final class BoardTracker {
         watch = .idle
         trackingMisses = 0
         relockCandidates.removeAll()
+        displayOffset = (.zero, 0, 0)
+        shiftLead = [0, 0, 0, 0]
+        shiftWins = [0, 0, 0, 0]
+        lastShiftUpdate = nil
         sightings = 0
         visibility = .notSeen(seconds: 0)
         selected = nil
         lastTapped = nil
         overlay.clearDrawings()
+        overlay.showLastMove([])
+        choices = []
         overlay.setStyle(.preview)
         overlay.root.isEnabled = false
         phase = hasTablePlane ? .findingBoard(progress: 0) : .findingTable
@@ -293,6 +376,7 @@ final class BoardTracker {
             runDetectionIfDue(frame, interval: detectionInterval)
         case .locked:
             runDetectionIfDue(frame, interval: lockedDetectionInterval)
+            decayDisplayOffset(now: frame.timestamp)
             if watchesMoves { watchForMoves(frame) }
         }
     }
@@ -307,7 +391,21 @@ final class BoardTracker {
     /// The board as the user sees it: the tracked pose turned so white is at
     /// the bottom.
     private var effectivePose: BoardPose? {
-        pose.map { BoardPose(center: $0.center, yaw: $0.yaw + Float(quarterTurns) * .pi / 2, side: $0.side) }
+        displayPose.map { BoardPose(center: $0.center, yaw: $0.yaw + Float(quarterTurns) * .pi / 2, side: $0.side) }
+    }
+
+    /// The world-fixed pose plus the latest per-frame correction.
+    private var displayPose: BoardPose? {
+        pose.map { BoardPose(center: $0.center + displayOffset.center, yaw: $0.yaw + displayOffset.yaw, side: $0.side + displayOffset.side) }
+    }
+
+    /// Fades the correction out when the board hasn't been seen for a bit,
+    /// since a stale one is no better than none.
+    private func decayDisplayOffset(now: TimeInterval) {
+        guard now - lastOffsetUpdate > 0.3, displayOffset.center != .zero || displayOffset.yaw != 0 else { return }
+        displayOffset = (displayOffset.center * 0.8, displayOffset.yaw * 0.8, displayOffset.side * 0.8)
+        if simd_length(displayOffset.center) < 0.0005 { displayOffset = (.zero, 0, 0) }
+        refreshOverlay()
     }
 
     private func watchForMoves(_ frame: ARFrame) {
@@ -322,7 +420,8 @@ final class BoardTracker {
             board: board.transform, side: board.side, depth: DepthPlane(frame)
         )
         let started = moveDetector.process(
-            request, position: game.position, findOrientation: needsOrientation && game.records.isEmpty
+            request, position: game.position, awaitingStart: game.records.isEmpty && !startConfirmed,
+            findOrientation: needsOrientation && game.records.isEmpty
         ) { [weak self] event, depth in
             Task { @MainActor in
                 if let depth { self?.lastDepthOccupancy = depth }
@@ -339,6 +438,9 @@ final class BoardTracker {
             case .busy: recorder.log("moves", ["event": "busy"])
             case .settled(let fit): recorder.log("moves", ["event": "settled", "fit": fit])
             case .oriented(let turns): recorder.log("moves", ["event": "oriented", "turns": turns])
+            case .awaitingStart(let fit): recorder.log("moves", ["event": "awaitingStart", "fit": fit])
+            case .ambiguous(let moves): recorder.log("moves", ["event": "ambiguous", "san": moves.map { game.position.san($0) }])
+            case .cleared, .newGame: break
             case .unclear(let bareness): recorder.log("moves", ["event": "unclear", "bareness": bareness])
             case .moved(let moves, let bareness):
                 var position = game.position
@@ -349,15 +451,39 @@ final class BoardTracker {
                 recorder.log("moves", ["event": "moved", "san": san, "bareness": bareness])
             }
         }
-        let waiting = needsOrientation && game.records.isEmpty
         switch event {
         case .busy:
             setWatch(.handInView)
         case .settled(let fit):
             self.fit = fit
-            setWatch(waiting ? .findingStart : .watching)
+            choices = []
+            if game.records.isEmpty { startConfirmed = true }
+            setWatch(.watching)
+        case .awaitingStart(let fit):
+            self.fit = fit
+            setWatch(.findingStart)
+        case .ambiguous(let moves):
+            choices = moves.map { ($0, game.position.san($0)) }
+            setWatch(.choosing)
+        case .cleared:
+            recorder.log("moves", ["event": "cleared"])
+            game = Game()
+            startConfirmed = false
+            needsOrientation = true
+            overlay.showLastMove([])
+            moveDetector.reset()
+            setWatch(.boardEmpty)
+        case .newGame:
+            recorder.log("moves", ["event": "newGame"])
+            game = Game()
+            startConfirmed = true
+            overlay.showLastMove([])
+            moveDetector.reset()
+            moveCount += 1
+            setWatch(.watching)
         case .oriented(let turns):
             needsOrientation = false
+            if game.records.isEmpty { startConfirmed = true }
             if turns != 0 {
                 quarterTurns = (quarterTurns + turns) % 4
                 moveDetector.reset()
@@ -368,6 +494,7 @@ final class BoardTracker {
             setWatch(.unclear)
         case .moved(let moves, let bareness):
             lastChanges = bareness
+            choices = []
             needsOrientation = false
             for move in moves { game.play(move) }
             moveCount += 1
@@ -384,7 +511,9 @@ final class BoardTracker {
         guard frame.timestamp - lastDetection >= interval,
               case .normal = frame.camera.trackingState
         else { return }
-        guard let target = searchTarget(frame) else {
+        let fresh = phase != .locked || trackingMisses >= 12 || frame.timestamp - lastFreshSearch >= freshSearchInterval
+        let aimed = phase != .locked || (fresh && freshSearches % 2 == 1)
+        guard let target = searchTarget(frame, aimed: aimed) else {
             if phase != .locked { setHint(hasTablePlane ? .aimAtTable : .mapTable, immediate: true) }
             return
         }
@@ -392,6 +521,11 @@ final class BoardTracker {
         let spot = SIMD3(target.center.x, target.planeY, target.center.y)
         let distance = simd_distance(eye, spot)
         lastSearchGeometry = (distance, asin(min(max((eye.y - target.planeY) / max(distance, 0.01), -1), 1)) * 180 / .pi)
+        if let elevation = lastSearchGeometry?.elevation {
+            // Hysteresis so it doesn't flicker around the line.
+            let low = viewTooLow ? elevation < 45 : elevation < 38
+            if low != viewTooLow { viewTooLow = low }
+        }
 
         guard let luma = LumaPlane(frame.capturedImage) else { return }
         let request = BoardLocator.Request(
@@ -400,7 +534,7 @@ final class BoardTracker {
             camera: frame.camera.transform,
             planeY: target.planeY,
             center: target.center,
-            predicted: phase == .locked && trackingMisses < 4
+            predicted: !fresh
                 ? predictedCorners(planeY: target.planeY, camera: frame.camera.transform.translation) : nil,
             wantsDebugImage: showsDebug
         )
@@ -408,7 +542,10 @@ final class BoardTracker {
         let started = locator.locate(request) { [weak self] detection in
             Task { @MainActor in self?.consume(detection, timestamp: timestamp) }
         }
-        if started { lastDetection = frame.timestamp }
+        if started {
+            lastDetection = frame.timestamp
+            if fresh { lastFreshSearch = frame.timestamp; freshSearches += 1 }
+        }
     }
 
     /// The locked board's corners pushed along the camera rays down to the
@@ -427,9 +564,13 @@ final class BoardTracker {
     }
 
     /// The table plane under the middle of the screen, and where on it to look.
-    private func searchTarget(_ frame: ARFrame) -> (planeY: Float, center: SIMD2<Float>)? {
-        if phase == .locked, let pose, let table = estimator.observations.last?.planeY {
-            return (table, SIMD2(pose.center.x, pose.center.z))
+    /// Fresh searches while locked alternate between around the lock and
+    /// where the phone points (`aimed`), so one awkward window can't hide the
+    /// board. Locked searches always use the board's own table plane.
+    private func searchTarget(_ frame: ARFrame, aimed: Bool) -> (planeY: Float, center: SIMD2<Float>)? {
+        let lockedTable = phase == .locked ? estimator.observations.last?.planeY : nil
+        if let lockedTable, let pose, !aimed {
+            return (lockedTable, SIMD2(pose.center.x, pose.center.z))
         }
         let camera = frame.camera.transform
         let origin = camera.translation
@@ -447,6 +588,7 @@ final class BoardTracker {
             return (simd_distance(hit, origin), hit)
         }
         guard let hit = hits.min(by: { $0.0 < $1.0 })?.1 else { return nil }
+        if let lockedTable { return (lockedTable, SIMD2(hit.x, hit.z)) }
         let center = pose?.center ?? hit
         return (hit.y, SIMD2(center.x, center.z))
     }
@@ -476,6 +618,7 @@ final class BoardTracker {
                     "center": pose.center.array, "yaw": pose.yaw, "side": pose.side,
                     "surface": surfaceHeight ?? NSNull(), "parallax": parallax, "sightings": sightings,
                     "quarterTurns": quarterTurns,
+                    "display": displayPose.map { ["center": $0.center.array, "yaw": $0.yaw, "side": $0.side] } ?? NSNull(),
                 ], time: timestamp)
             }
         }
@@ -500,7 +643,7 @@ final class BoardTracker {
             return
         }
 
-        if let current = pose, simd_distance(current.center, candidate.center) > 0.1 {
+        if let current = pose, simd_distance(current.center, avg(observation.corners(atHeight: current.center.y))) > 0.1 {
             recentPoses.removeAll()
             estimator.reset()
             referenceYaw = nil
@@ -542,14 +685,34 @@ final class BoardTracker {
         observation.time = timestamp
         let rough = avg(observation.corners(atHeight: current.center.y))
 
-        if simd_distance(rough, current.center) < 0.03 {
+        // A square is about 4 cm, so anything this close is the same board.
+        // Tracked sightings always are: refining can't move the grid more
+        // than a few centimetres, and if the height estimate is off they will
+        // sit further than that from the drawn board until they correct it,
+        // so turning them away would keep the height wrong for good.
+        if detection.tracked || simd_distance(rough, current.center) < 0.02 {
+            if detection.tracked { lockedScore = detection.score }
+            if let leads = detection.shiftLeads, shiftIfLockedOff(leads, timestamp: timestamp) { return }
             trackingMisses = 0
             relockCandidates.removeAll()
-            estimator.add(observation)
             lastAccepted = timestamp
-            sightings = estimator.observations.count
-            guard let fused = fusedPose() else { return }
-            pose = current.blended(toward: fused, amount: 0.3)
+            if timestamp - lastEstimatorAdd >= estimatorInterval {
+                lastEstimatorAdd = timestamp
+                estimator.add(observation)
+                sightings = estimator.observations.count
+                if let fused = fusedPose() { pose = current.blended(toward: fused, amount: 0.3) }
+            }
+            // Where the board is in this very frame, at the estimated height.
+            if let base = pose, let seen = BoardPose.fromCorners(observation.corners(atHeight: base.center.y), camera: observation.camera) {
+                let target = (seen.center - base.center, BoardPose.wrapQuarter(seen.yaw - base.yaw), seen.side - base.side)
+                let k: Float = 0.6
+                displayOffset = (
+                    displayOffset.center + (target.0 - displayOffset.center) * k,
+                    displayOffset.yaw + (target.1 - displayOffset.yaw) * k,
+                    displayOffset.side + (target.2 - displayOffset.side) * k
+                )
+                lastOffsetUpdate = timestamp
+            }
             refreshOverlay()
             return
         }
@@ -557,26 +720,79 @@ final class BoardTracker {
         // A fresh search found the board somewhere else. Follow it once a few
         // sightings in a row agree, keeping the game and orientation.
         if detection.tracked { trackingMisses += 1; return }
-        relockCandidates.removeAll { timestamp - $0.time > 3 }
+        // A fresh search a square or two away is the classic starting-position
+        // slide, not a moved board; the shift check handles real one-square
+        // errors with far more evidence. Only follow big jumps, or a board
+        // that has been lost for a while.
+        var away = candidate.center - current.center
+        away.y = 0
+        guard simd_length(away) > 2.5 * current.side / 8 || trackingMisses >= 12 else { return }
+        // Only move to a spot that looks more like a board than the current one.
+        guard detection.score > lockedScore + 20 || trackingMisses >= 12 else { return }
+        relockCandidates.removeAll { timestamp - $0.time > 4 }
         if let last = relockCandidates.last, simd_distance(last.pose.center, candidate.center) > 0.02 {
             relockCandidates.removeAll()
         }
         relockCandidates.append((timestamp, candidate, observation))
         guard relockCandidates.count >= 3 else { return }
 
-        estimator.reset()
-        for sighting in relockCandidates { estimator.add(sighting.observation) }
+        // Keep the history if it agrees with the new sightings once the height
+        // is refitted with both: then the board didn't move, the height was
+        // just wrong. Otherwise start the estimate over from the new spot.
+        var merged = estimator
+        for sighting in relockCandidates { merged.add(sighting.observation) }
+        if let fit = merged.pose(referenceYaw: current.yaw),
+           relockCandidates.allSatisfy({ simd_distance(avg($0.observation.corners(atHeight: fit.center.y)), fit.center) < 0.02 }) {
+            estimator = merged
+        } else {
+            estimator.reset()
+            for sighting in relockCandidates { estimator.add(sighting.observation) }
+        }
         referenceYaw = current.yaw
         relockCandidates.removeAll()
         trackingMisses = 0
         lastAccepted = timestamp
         if let fused = fusedPose() {
             pose = fused
+            displayOffset = (.zero, 0, 0)
             refreshOverlay()
             moveDetector.reset()
             relockCount += 1
             recorder.log("relock", ["center": fused.center.array, "yaw": fused.yaw])
+            shiftLead = [0, 0, 0, 0]
+            shiftWins = [0, 0, 0, 0]
         }
+    }
+
+    /// Adds up evidence that the grid should sit one square over, and moves
+    /// it once the evidence is clear. Returns true if it moved.
+    private func shiftIfLockedOff(_ leads: [Float], timestamp: TimeInterval) -> Bool {
+        let dt = Float(lastShiftUpdate.map { min(timestamp - $0, 0.5) } ?? 0.07)
+        lastShiftUpdate = timestamp
+        let alpha = 1 - exp(-dt / 1.5)
+        for i in 0..<4 {
+            shiftLead[i] += alpha * (leads[i] - shiftLead[i])
+            shiftWins[i] += alpha * ((leads[i] > 0 ? 1 : 0) - shiftWins[i])
+        }
+        guard let best = (0..<4).max(by: { shiftLead[$0] < shiftLead[$1] }),
+              shiftLead[best] > shiftThreshold, shiftWins[best] > 0.7, let current = pose
+        else { return false }
+
+        let grid = GridFinder.shifts[best + 1]
+        let square = current.side / 8
+        let local = SIMD4(grid.x * square, 0, grid.y * square, 0)
+        let world = current.transform * local
+        let offset = SIMD3(world.x, 0, world.z)
+        pose = BoardPose(center: current.center + offset, yaw: current.yaw, side: current.side)
+        estimator.shift(by: offset)
+        shiftLead = [0, 0, 0, 0]
+        shiftWins = [0, 0, 0, 0]
+        displayOffset = (.zero, 0, 0)
+        moveDetector.reset()
+        relockCount += 1
+        recorder.log("shift", ["by": grid.array, "center": pose!.center.array], time: timestamp)
+        refreshOverlay()
+        return true
     }
 
     private func fusedPose() -> BoardPose? {
@@ -669,7 +885,7 @@ final class BoardTracker {
     }
 
     private func refreshOverlay() {
-        guard let pose else { return }
+        guard let pose = displayPose else { return }
         overlay.apply(pose: pose, quarterTurns: quarterTurns)
     }
 

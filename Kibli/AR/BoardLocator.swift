@@ -27,6 +27,10 @@ final class BoardLocator: @unchecked Sendable {
         let observation: BoardObservation?
         let checker: Int
         let edge: Float
+        var score: Float = 0
+        /// While tracking: how much better the grid scores moved one square
+        /// in each of `GridFinder.shifts[1...]` than where it is.
+        var shiftLeads: [Float]?
         let debugImage: CGImage?
         /// How many of the best grid's corners were inside the camera image,
         /// 0 to 4, whether or not it was good enough to accept.
@@ -102,9 +106,16 @@ final class BoardLocator: @unchecked Sendable {
             observation: observation,
             checker: grid.checker,
             edge: grid.edge,
+            score: grid.score,
+            shiftLeads: tracking ? Self.leads(image, grid.corners) : nil,
             debugImage: request.wantsDebugImage ? Self.debugImage(image, corners: grid.corners) : nil,
             cornersInView: grid.corners.map(image.world).filter { Self.inView($0, request) }.count
         )
+    }
+
+    private static func leads(_ image: TopDownImage, _ corners: [SIMD2<Float>]) -> [Float] {
+        let scores = GridFinder.shiftScores(image, corners: corners)
+        return scores.dropFirst().map { $0 - scores[0] }
     }
 
     private static func inView(_ world: SIMD3<Float>, _ request: Request) -> Bool {

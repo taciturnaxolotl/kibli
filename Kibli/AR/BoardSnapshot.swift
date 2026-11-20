@@ -69,6 +69,7 @@ struct BoardSnapshot: Sendable {
         let local = board.inverse * cameraTransform.columns.3
         camera = SIMD3((local.x + half) / side * 8, (half - local.z) / side * 8, local.y / side * 8)
         stats = computeStats()
+        extremes = computeExtremes()
         let k = Self.squarePixels
         visible = (0..<64).map { index in
             let rank = index / 8, file = index % 8
@@ -83,6 +84,28 @@ struct BoardSnapshot: Sendable {
     /// Mean brightness and spread of the middle of each square, indexed
     /// rank * 8 + file.
     func squareStats() -> [(mean: Float, deviation: Float, edges: Float)] { stats }
+
+    /// The 10th and 90th percentile brightness of each square's middle,
+    /// indexed rank * 8 + file. White pieces bring highlights brighter than
+    /// any square, black pieces shadows darker than any square, which is how
+    /// a capture (same square, other colour) shows up.
+    private(set) var extremes: [(low: Float, mid: Float, high: Float)] = []
+
+    private func computeExtremes() -> [(low: Float, mid: Float, high: Float)] {
+        let n = Self.size, k = Self.squarePixels
+        let inset = k / 6
+        return (0..<64).map { index in
+            let rank = index / 8, file = index % 8
+            let row0 = (7 - rank) * k, col0 = file * k
+            var values: [Float] = []
+            values.reserveCapacity(k * k)
+            for row in (row0 + inset)..<(row0 + k - inset) {
+                for col in (col0 + inset)..<(col0 + k - inset) { values.append(pixels[row * n + col]) }
+            }
+            values.sort()
+            return (values[values.count / 10], values[values.count / 2], values[values.count * 9 / 10])
+        }
+    }
 
     private func computeStats() -> [(mean: Float, deviation: Float, edges: Float)] {
         let n = Self.size, k = Self.squarePixels
